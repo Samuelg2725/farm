@@ -8,6 +8,9 @@ Everything is **free and open source**, and runs on site with no cloud and no su
 |---|---|---|
 | [Frigate](https://github.com/blakeblackshear/frigate) | records, detects people & vehicles, draws boxes, PTZ control | MIT |
 | [FastALPR](https://github.com/ankandrew/fast-alpr) (inside plate-watcher) | finds + reads number plates from full 4K frames | MIT |
+| people-tracker (our code) | live view with **numbered boxes** (Person 1, 2, 3…) + person alerts | ours |
+| ├ [YOLOX](https://github.com/Megvii-BaseDetection/YOLOX) | person detector used by people-tracker | Apache-2.0 |
+| └ [Norfair](https://github.com/tryolabs/norfair) | follows each person between frames (same tracker Frigate uses) | BSD-3 |
 | plate-watcher (our code) | checks plates against `whitelist.yaml`, logs every vehicle, alerts on unknowns | ours |
 | [ntfy](https://github.com/binwiederhier/ntfy) | push alerts with photo to phones | Apache-2.0 / GPL-2.0 |
 | Mosquitto | message bus between them | EPL/EDL |
@@ -95,7 +98,19 @@ Open **https://PC-IP:8971** (accept the certificate warning), log in as `admin`,
 - **Review** tab – every alert/detection with clip and snapshot (boxes drawn on).
 - **Explore** – search past objects; recognised plates show as labels on cars.
 
-## 5. Whitelist (owner's cars)
+## 5. Live view with numbered people
+
+Open **http://localhost:8090** (or `http://HOST_IP:8090` from a phone/laptop on the network).
+
+- Every person gets a coloured box labelled **Person 1, Person 2…**; the same person keeps their number while they're in view. Numbers restart each day.
+- Top bar shows the time and how many people are in view.
+- Each new person is logged to `data/people.db`.
+- **Person alerts** go to the ntfy app with the numbered picture. Set when in `.env`:
+  `PERSON_ALERT_HOURS=always`, `never`, or a time range like `18:00-07:00` (out of hours only). Max one alert per 5 minutes so a group doesn't spam you.
+
+Logs: `docker logs -f people-tracker`
+
+## 5b. Whitelist (owner's cars)
 
 Edit `plate-watcher/whitelist.yaml`:
 

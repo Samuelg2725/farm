@@ -67,3 +67,23 @@ services:
       - ./plate-watcher/whitelist.yaml:/app/whitelist.yaml:ro
       - ./data:/data
     depends_on: [mqtt, frigate, ntfy]
+
+  # Live view with numbered boxes round each person + person alerts
+  people-tracker:
+    build: ./people-tracker
+    container_name: people-tracker
+    restart: unless-stopped
+    environment:
+      TZ: ${TZ:-Europe/London}
+      CAMERA: yard_ptz
+      STREAM_URL: rtsp://frigate:8554/yard_ptz_sub   # low-res stream via Frigate
+      NTFY_URL: http://ntfy/${NTFY_TOPIC:-farm-alerts}
+      PERSON_ALERT_HOURS: ${PERSON_ALERT_HOURS:-always}   # always | never | 18:00-07:00
+      PERSON_ALERT_COOLDOWN: "300"                        # seconds between person alerts
+      FPS: "5"
+      DB_PATH: /data/people.db
+    volumes:
+      - ./data:/data
+    ports:
+      - "8090:8090"   # live view: http://localhost:8090
+    depends_on: [frigate, ntfy]
