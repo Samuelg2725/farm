@@ -1,4 +1,4 @@
-"""The dashboard: live view, what's in view now, activity log, vehicles, recordings, phone alerts."""
+"""HTTP server for the dashboard, JSON API, MJPEG live stream and recording playback."""
 from __future__ import annotations
 
 import json
@@ -20,11 +20,11 @@ class LiveState:
         self.lag = 0.0
         self.recording = ""
         self.zones: list[dict] = []
-        self.raw_jpeg: bytes = b""   # picture without boxes, for drawing zones
+        self.raw_jpeg: bytes = b""   # unannotated frame for the zone editor
 
 
 class App:
-    """Everything the web page needs to read."""
+    """Shared objects exposed to the HTTP handlers."""
 
     def __init__(self, state: LiveState, db, notifier, recordings_dir: str, camera: str, keep_days: int,
                  zone_store=None, switches=None):
@@ -156,7 +156,7 @@ class Handler(BaseHTTPRequestHandler):
             pass
 
     def _send_file(self, rel: str):
-        """Serves a recording, with Range support so browsers can play and seek video."""
+        """Serve a recording file with HTTP Range support for in-browser playback and seeking."""
         base = self.app.recordings_dir.resolve()
         f = (base / unquote(rel)).resolve()
         if base not in f.parents or not f.is_file() or f.suffix not in (".mp4", ".jpg"):

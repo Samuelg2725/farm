@@ -1,11 +1,11 @@
-"""Pure logic: daily person numbering and when to send alerts (no I/O, easy to test)."""
+"""Stateless and side-effect-free helpers: numbering, schedules, stream latency and alert timing."""
 from __future__ import annotations
 
 from datetime import datetime, time
 
 
 class DailyNumbers:
-    """Gives each tracked person a friendly number (Person 1, 2, 3...) that restarts each day."""
+    """Assigns sequential display numbers to track ids; numbering restarts daily."""
 
     def __init__(self):
         self.day = None
@@ -58,10 +58,10 @@ class AlertPolicy:
 
 
 class LagMeter:
-    """Estimates how far behind live we are from stream timestamps.
+    """Estimates processing latency from stream timestamps.
 
-    For a live stream, (wall clock - stream timestamp) stays constant when we keep up.
-    If decoding is too slow, frames queue up and that difference grows: that growth is our lag.
+    For a live stream, (wall clock - presentation timestamp) is constant while decoding keeps up.
+    Any increase over the observed minimum is accumulated latency.
     """
 
     def __init__(self):
@@ -78,17 +78,17 @@ class LagMeter:
 
 
 class PersonAlerter:
-    """Decides when to send "person seen" alerts while person alerts are switched on.
+    """Schedules person notifications.
 
-    A new person is announced `delay` seconds after they appear (so we can say what they're doing),
-    people arriving together share one alert, and alerts are at least `gap` seconds apart (later
-    arrivals wait and are included in the next one). Each behaviour of each person (running,
-    crouching…) alerts at most once per `behaviour_cooldown`.
+    Arrivals are reported `delay` seconds after first detection so the current behaviour can be
+    included. Concurrent arrivals are grouped and notifications are spaced at least `gap` seconds
+    apart; arrivals during the gap are carried into the next notification. Each (person, behaviour)
+    pair is notified at most once per `behaviour_cooldown`.
     """
 
     def __init__(self, delay: float = 2.0, gap: float = 20.0, behaviour_cooldown: float = 60.0):
         self.delay, self.gap, self.behaviour_cooldown = delay, gap, behaviour_cooldown
-        self.pending: dict[int, tuple[int, float]] = {}   # track id -> (person number, time seen)
+        self.pending: dict[int, tuple[int, float]] = {}   # track id -> (display number, first seen)
         self.last_sent = -1e18
         self.behaviour_sent: dict[tuple[int, str], float] = {}
 
@@ -99,13 +99,13 @@ class PersonAlerter:
         return tid in self.pending
 
     def due(self, t: float, present: set[int]) -> list[tuple[int, int]]:
-        """People to announce now: [(track id, number)]. People who already left are dropped."""
+        """Return arrivals to notify now as [(track id, number)]. Tracks no longer present are discarded."""
         for tid in [k for k in self.pending if k not in present]:
             del self.pending[tid]
         ready = [(tid, n) for tid, (n, since) in self.pending.items() if t - since >= self.delay]
         if not ready or t - self.last_sent < self.gap:
             return []
-        out = [(tid, n) for tid, (n, _) in self.pending.items()]  # include anyone else waiting
+        out = [(tid, n) for tid, (n, _) in self.pending.items()]  # include all pending arrivals
         self.pending.clear()
         self.last_sent = t
         return sorted(out, key=lambda x: x[1])

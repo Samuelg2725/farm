@@ -1,10 +1,10 @@
-"""Records while a person or vehicle is in view – two files per clip:
+"""Event recording while people or vehicles are in view.
 
-  HH-MM-SS.mp4      the live view WITH boxes, labels and plates drawn on (1080p H.264)
-  HH-MM-SS_4k.mp4   the camera's original 4K video, copied as-is (evidence quality, no CPU)
-  HH-MM-SS.jpg      thumbnail
-
-Files go in /recordings/YYYY-MM-DD/. Old days are deleted after `keep_days`.
+Each clip produces, under <out_dir>/YYYY-MM-DD/:
+  HH-MM-SS.mp4     annotated video (1080p H.264)
+  HH-MM-SS_4k.mp4  original camera stream, stream-copied without re-encoding
+  HH-MM-SS.jpg     thumbnail
+Directories older than `keep_days` are removed.
 """
 from __future__ import annotations
 
@@ -18,28 +18,28 @@ from pathlib import Path
 
 log = logging.getLogger("vision")
 
-_FRAG = ["-movflags", "+frag_keyframe+empty_moov+default_base_moof"]  # playable even while still recording
+_FRAG = ["-movflags", "+frag_keyframe+empty_moov+default_base_moof"]  # fragmented MP4: playable while still being written
 
 
 def raw_cmd(url: str, out: Path, codec: str) -> list[str]:
     cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin"]
-    cmd += ["-rtsp_transport", "tcp"] if url.startswith("rtsp") else ["-re"]  # -re: test files at real speed
+    cmd += ["-rtsp_transport", "tcp"] if url.startswith("rtsp") else ["-re"]  # -re: read file inputs at native rate
     cmd += ["-i", url, "-map", "0:v", "-map", "0:a?", "-c", "copy"]
     if codec == "hevc":
-        cmd += ["-tag:v", "hvc1"]  # lets Safari / QuickTime play H.265
+        cmd += ["-tag:v", "hvc1"]  # required by Safari/QuickTime for HEVC
     return cmd + _FRAG + ["-f", "mp4", str(out)]
 
 
 def annotated_cmd(out: Path) -> list[str]:
     return ["ffmpeg", "-hide_banner", "-loglevel", "error",
-            # millisecond timestamps from the real clock (frames arrive at a varying rate)
+            # wall-clock timestamps at millisecond resolution (variable frame rate)
             "-f", "image2pipe", "-framerate", "1000", "-use_wallclock_as_timestamps", "1", "-c:v", "mjpeg", "-i", "-",
             "-c:v", "libx264", "-preset", "veryfast", "-crf", "25", "-pix_fmt", "yuv420p", "-bf", "0",
             "-g", "24", "-fps_mode", "passthrough", "-video_track_timescale", "1000", *_FRAG, "-f", "mp4", str(out)]
 
 
 class _AnnotatedWriter:
-    """Feeds rendered JPEG frames to ffmpeg on a background thread (never blocks the live view)."""
+    """Encodes JPEG frames via ffmpeg on a background thread without blocking the caller."""
 
     def __init__(self, out: Path):
         self.proc = subprocess.Popen(annotated_cmd(out), stdin=subprocess.PIPE,
@@ -62,7 +62,7 @@ class _AnnotatedWriter:
         try:
             self.q.put_nowait(jpeg)
         except queue.Full:
-            pass  # drop a frame rather than lag
+            pass  # drop frames rather than block
 
     def close(self) -> str:
         self.q.put(None)
@@ -86,7 +86,7 @@ class Recorder:
         self.enabled, self.keep_raw = enabled, keep_raw
         self.raw: subprocess.Popen | None = None
         self.annotated: _AnnotatedWriter | None = None
-        self.clip: str = ""             # e.g. "2026-11-23/12-25-43.mp4" (relative to out_dir)
+        self.clip: str = ""             # current clip path relative to out_dir
         self.started: datetime | None = None
         self.last_active: datetime | None = None
         self.codec = "h264"
@@ -100,13 +100,13 @@ class Recorder:
         return bool(self.clip)
 
     def feed(self, jpeg: bytes) -> None:
-        """Called by the live view for every frame it draws."""
+        """Submit an annotated frame to the current clip."""
         with self.lock:
             if self.annotated is not None:
                 self.annotated.feed(jpeg)
 
     def update(self, now: datetime, active: bool, thumb_jpeg: bytes = b"") -> tuple[str, dict] | None:
-        """Call every detection cycle. Returns ("started"|"stopped", clip_info) when that happens."""
+        """Advance the recording state; returns ("started" | "stopped", info) on a transition, else None."""
         if not self.enabled:
             return None
         if active:
@@ -114,7 +114,7 @@ class Recorder:
             if not self.recording:
                 return self._start(now, thumb_jpeg)
             if (now - self.started).total_seconds() > self.max_length:
-                return self._stop(now)  # a fresh clip starts next cycle
+                return self._stop(now)  # split long clips; a new clip starts on the next cycle
         elif self.recording and (now - self.last_active).total_seconds() > self.post_roll:
             return self._stop(now)
         return None
@@ -145,7 +145,7 @@ class Recorder:
         errors = [writer.close()] if writer else []
         if self.raw is not None:
             if self.raw.poll() is None:
-                self.raw.terminate()  # ffmpeg closes the file cleanly on SIGTERM
+                self.raw.terminate()  # ffmpeg finalises the file on SIGTERM
                 try:
                     self.raw.wait(timeout=10)
                 except subprocess.TimeoutExpired:

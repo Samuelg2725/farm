@@ -1,8 +1,8 @@
-"""Plate normalising and fuzzy whitelist matching.
+"""Plate normalisation and tolerant whitelist matching.
 
-OCR often confuses look-alike characters (O/0, I/1, B/8...). We compare a
-"canonical" form where look-alikes are folded together, then allow a small
-edit distance so one misread character doesn't flag the owner's own car.
+OCR commonly confuses similar characters (O/0, I/1, B/8, ...). Plates are compared in a
+canonical form in which these characters are folded together, with a small permitted edit
+distance, so a single misread character does not cause a whitelisted vehicle to be flagged.
 """
 from __future__ import annotations
 
@@ -38,7 +38,7 @@ class Vehicle:
 
 
 def find_match(plate: str, vehicles: list[Vehicle], max_distance: int = 1) -> Vehicle | None:
-    """Return the whitelisted vehicle this read most likely is, or None."""
+    """Return the closest whitelisted vehicle within `max_distance`, or None."""
     read = canonical(plate)
     if not read:
         return None

@@ -1,4 +1,4 @@
-"""Phone alerts via ntfy (open source). Works with the public ntfy.sh server or your own."""
+"""Notifications via ntfy (self-hosted or ntfy.sh) and persisted dashboard switches."""
 from __future__ import annotations
 
 import base64
@@ -16,9 +16,11 @@ GUESSABLE = {"", "farm-alerts", "alerts", "farm", "test"}
 
 
 def resolve_topic(server: str, topic: str, data_dir: str) -> str:
-    """On a public server a guessable topic would let strangers read your alerts,
-    so we generate a random one once and remember it in data/ntfy_topic.txt."""
-    public = not server.startswith("http://ntfy")  # our own container is http://ntfy
+    """Return the topic to publish to.
+
+    On a public server a guessable topic would expose notifications, so a random topic is
+    generated once and persisted to <data_dir>/ntfy_topic.txt."""
+    public = not server.startswith("http://ntfy")  # the bundled ntfy container
     if not public or topic.strip().lower() not in GUESSABLE:
         return topic.strip() or "farm-alerts"
     f = Path(data_dir) / "ntfy_topic.txt"
@@ -39,8 +41,8 @@ def resolve_topic(server: str, topic: str, data_dir: str) -> str:
 
 
 def header_value(text: str) -> str:
-    """HTTP headers can't hold new lines or non-ASCII (e.g. "–", "£"). ntfy understands
-    "\\n" for new lines and RFC 2047 encoding for everything else."""
+    """Encode a value for an HTTP header: newlines as the literal "\\n" (interpreted by ntfy)
+    and non-ASCII text using RFC 2047."""
     text = text.replace("\r", "").replace("\n", "\\n")
     try:
         text.encode("ascii")
@@ -54,7 +56,7 @@ class Notifier:
         self.server = server.rstrip("/")
         self.topic = resolve_topic(self.server, topic, data_dir)
         self.db = db
-        # the address phones use (inside Docker the local server is called http://ntfy)
+        # server address as reached from client devices
         self.phone_server = (public_url or self.server).rstrip("/")
 
     @property
@@ -67,7 +69,7 @@ class Notifier:
 
     def send(self, title: str, body: str, jpeg: bytes = b"", tags: str = "", priority: str = "high",
              filename: str = "alert.jpg") -> bool:
-        """jpeg = optional attachment (a photo, or a video when filename ends in .mp4)."""
+        """Publish a notification. `jpeg` is an optional attachment; `filename` sets its name and type."""
         headers = {"Title": header_value(title), "Priority": priority}
         if tags:
             headers["Tags"] = tags
@@ -79,7 +81,7 @@ class Notifier:
             else:
                 r = requests.post(self.url, data=body.encode(), headers=headers, timeout=10)
             r.raise_for_status()
-        except Exception as e:  # network down, server refused…
+        except Exception as e:  # network or server error
             ok, err = False, str(e)[:300]
             log.warning("Alert not delivered: %s", err)
         log.info("ALERT %s: %s – %s", "sent" if ok else "FAILED", title, body)
@@ -98,7 +100,7 @@ class Notifier:
 
 
 class Switches:
-    """On/off switches set from the dashboard, remembered across restarts (data/switches.json)."""
+    """Boolean settings changed from the dashboard and persisted to <data_dir>/switches.json."""
 
     def __init__(self, data_dir: str, defaults: dict):
         import json

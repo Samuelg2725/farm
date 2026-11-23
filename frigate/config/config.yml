@@ -1,5 +1,5 @@
-# Frigate config – Reolink RLC-823S2 starter.
-# {FRIGATE_*} values come from .env via docker-compose.
+# Frigate configuration for a Reolink RLC-823S2.
+# {FRIGATE_*} variables are supplied from .env by docker-compose.
 
 mqtt:
   enabled: true
@@ -7,20 +7,19 @@ mqtt:
 
 go2rtc:
   streams:
-    # 4K main stream (H.265) – used for recording
+    # main stream (4K H.265): recording and vision service
     yard_ptz:
       - rtsp://{FRIGATE_CAM_USER}:{FRIGATE_CAM_PASS}@{FRIGATE_CAM_IP}:554/Preview_01_main
-    # low-res sub stream – used for detection (cheap to decode)
+    # sub stream: Frigate detection
     yard_ptz_sub:
       - rtsp://{FRIGATE_CAM_USER}:{FRIGATE_CAM_PASS}@{FRIGATE_CAM_IP}:554/Preview_01_sub
 
-# Start on CPU. On an Intel mini PC switch to OpenVINO (see README).
+# CPU detector; use OpenVINO on Intel hardware.
 detectors:
   cpu1:
     type: cpu
 
-# Number plates are read by our "vision" service (FastALPR on 4K frames),
-# so Frigate's own plate reader is off to save CPU.
+# Plate recognition is handled by the vision service.
 lpr:
   enabled: false
 
@@ -49,7 +48,7 @@ snapshots:
 cameras:
   yard_ptz:
     ffmpeg:
-      # hwaccel_args: preset-vaapi     # uncomment with Intel GPU
+      # hwaccel_args: preset-vaapi  # Intel iGPU
       inputs:
         - path: rtsp://127.0.0.1:8554/yard_ptz
           input_args: preset-rtsp-restream
@@ -57,21 +56,19 @@ cameras:
         - path: rtsp://127.0.0.1:8554/yard_ptz_sub
           input_args: preset-rtsp-restream
           roles: [detect]
-    # Live view in Frigate: pick "Main (4K)" in the stream menu for full quality
+    # streams selectable in the Frigate live view
     live:
       streams:
         Main (4K): yard_ptz
         Sub (fast): yard_ptz_sub
     detect:
       enabled: true
-      width: 640      # set to your sub stream resolution
+      width: 640      # sub stream resolution
       height: 360
       fps: 5
-    # PTZ control from the Frigate UI. Use the camera's own auto-tracking
-    # (Reolink app) – Frigate's autotracker needs ONVIF features Reolink lacks.
+    # PTZ control from the Frigate UI (use the camera's built-in auto-tracking).
     onvif:
       host: "{FRIGATE_CAM_IP}"
       port: 8000
       user: "{FRIGATE_CAM_USER}"
       password: "{FRIGATE_CAM_PASS}"
-    # Zones (gate, yard…) get added here once we know the site layout.

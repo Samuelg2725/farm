@@ -1,4 +1,4 @@
-"""SQLite log of everything seen: people, vehicles (with plate details), recordings, alerts."""
+"""SQLite storage for events, recordings and notifications."""
 from __future__ import annotations
 
 import sqlite3
@@ -37,7 +37,7 @@ CREATE TABLE IF NOT EXISTS alerts (
 
 
 class DB:
-    """One shared connection guarded by a lock (writes from the main loop, reads from the web page)."""
+    """Thread-safe wrapper around a single SQLite connection."""
 
     def __init__(self, path: str):
         self.conn = sqlite3.connect(path, check_same_thread=False)
@@ -47,7 +47,7 @@ class DB:
             self.conn.execute("PRAGMA journal_mode=WAL")
             self.conn.executescript(SCHEMA)
             have = {r[1] for r in self.conn.execute("PRAGMA table_info(events)")}
-            for col in ("actions", "details"):  # upgrade databases made by older versions
+            for col in ("actions", "details"):  # migrate databases created by earlier versions
                 if col not in have:
                     self.conn.execute(f"ALTER TABLE events ADD COLUMN {col} TEXT")
             self.conn.commit()

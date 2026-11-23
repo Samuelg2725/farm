@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Checks the camera is reachable and both video streams work (macOS + Linux).
+# Verifies camera reachability, service ports and RTSP streams (macOS and Linux).
 # Usage: ./scripts/check_camera.sh
 set -uo pipefail
 cd "$(dirname "$0")/.."

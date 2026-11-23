@@ -1,4 +1,4 @@
-"""Number plate reading (FastALPR, MIT) + per-vehicle decisions against the whitelist."""
+"""Number plate recognition (FastALPR) and per-vehicle whitelist decisions."""
 from __future__ import annotations
 
 import logging
@@ -19,7 +19,7 @@ OCR_MODEL = os.getenv("ALPR_OCR_MODEL", "cct-s-v2-global-model")
 
 
 def crop_scaled(frame: np.ndarray, box, src_size: tuple[int, int], pad: float = 0.15) -> np.ndarray:
-    """Crop `box` (x1,y1,x2,y2 measured on a src_size=(w,h) image) out of a bigger frame of the same view."""
+    """Crop `box` (x1, y1, x2, y2 in a `src_size` image) from `frame`, scaling to its resolution, with padding."""
     h, w = frame.shape[:2]
     sx, sy = w / src_size[0], h / src_size[1]
     x1, y1, x2, y2 = box
@@ -31,7 +31,7 @@ def crop_scaled(frame: np.ndarray, box, src_size: tuple[int, int], pad: float = 
 
 class PlateReader:
     def __init__(self):
-        from fast_alpr import ALPR  # heavy import
+        from fast_alpr import ALPR  # deferred: slow to import
         self.alpr = ALPR(detector_model=DETECTOR_MODEL, ocr_model=OCR_MODEL, detector_conf_thresh=0.3)
         log.info("Plate reader ready (%s / %s)", DETECTOR_MODEL, OCR_MODEL)
 
@@ -51,7 +51,7 @@ class PlateReader:
 
 
 class Whitelist:
-    """Reloads the YAML file automatically when it changes."""
+    """Whitelist loaded from YAML; reloaded automatically when the file changes."""
 
     def __init__(self, path: str):
         self.path, self._mtime, self.vehicles = Path(path), 0.0, []
@@ -79,7 +79,7 @@ class PlateInfo:
     grabs: int = 0
     last_grab: float = -1e18
     crop_jpeg: bytes = b""
-    photo_jpeg: bytes = b""          # vehicle + enlarged plate close-up, for the phone alert
+    photo_jpeg: bytes = b""          # vehicle image with enlarged plate inset, used for notifications
     ocr_country: str = ""
     ocr_country_conf: float = 0.0
     colour: str = ""
@@ -96,10 +96,10 @@ class PlateInfo:
 
 
 class PlateBook:
-    """Tracks plate reads for each vehicle on screen and decides known / unknown once.
+    """Accumulates plate reads per vehicle track and makes a single known/unknown decision.
 
-    Decision when we have a confident read AND (2+ reads agree-ish, or the vehicle
-    has left, or `delay` seconds passed since first seen).
+    A decision is made once a read meets `min_score` and either two or more reads have been
+    collected, the vehicle has left the scene, or `delay` seconds have elapsed.
     """
 
     def __init__(self, min_score=0.7, delay=8.0, grab_interval=2.0, max_grabs=4, max_distance=1):
@@ -133,7 +133,7 @@ class PlateBook:
                 p.photo_jpeg = photo_jpeg
 
     def decide(self, tid: int, now: float, whitelist: list[Vehicle], lost: bool = False) -> PlateInfo | None:
-        """Returns the PlateInfo if it was decided just now, else None."""
+        """Return the PlateInfo if a decision was made on this call, otherwise None."""
         p = self.items.get(tid)
         if p is None or p.decided or p.score < self.min_score:
             return None

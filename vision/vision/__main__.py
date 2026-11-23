@@ -1,9 +1,14 @@
-"""Farm vision: people tracking + vehicle number plates, at the same time, with a dashboard.
+"""Vision service entry point.
 
-4K camera stream → YOLOX finds people AND vehicles in one pass → Norfair follows each one
-→ people: "Person 1, 2, 3…"   vehicles: "Vehicle 1" + plate (FastALPR on a 4K crop) + KNOWN/UNKNOWN
-→ everything logged (with confidence %), recorded (with boxes) and alerted to phones (ntfy).
-Dashboard: http://<host>:8090
+Pipeline per frame of the camera's main stream:
+  1. YOLOX detects people and vehicles in a single pass.
+  2. Norfair tracks each object so it keeps a stable identifier.
+  3. People: RTMPose keypoints and motion analysis classify behaviour.
+     Vehicles: FastALPR reads the number plate from a full-resolution crop and
+     the result is checked against the whitelist.
+  4. Events are logged to SQLite, clips are recorded, and notifications are sent via ntfy.
+
+The web dashboard is served on PORT (default 8090).
 """
 from __future__ import annotations
 
@@ -43,10 +48,10 @@ DISPLAY_WIDTH = int(env("DISPLAY_WIDTH", "1920"))
 DISPLAY_FPS = float(env("DISPLAY_FPS", "12"))
 JPEG_QUALITY = int(env("JPEG_QUALITY", "85"))
 MAX_LAG = float(env("MAX_LAG", "2"))
-PERSON_ALERTS = env("PERSON_ALERTS", "1") == "1"            # starting state of the dashboard on/off button
-PERSON_ALERT_HOURS = env("PERSON_ALERT_HOURS", "always")     # while switched on, only alert in these hours
-PERSON_ALERT_GAP = float(env("PERSON_ALERT_GAP", "20"))      # min seconds between "person seen" alerts
-PERSON_BEHAVIOUR_COOLDOWN = float(env("PERSON_BEHAVIOUR_COOLDOWN", "60"))  # same person + same behaviour
+PERSON_ALERTS = env("PERSON_ALERTS", "1") == "1"            # initial state of the person-alert switch
+PERSON_ALERT_HOURS = env("PERSON_ALERT_HOURS", "always")     # active hours for person alerts
+PERSON_ALERT_GAP = float(env("PERSON_ALERT_GAP", "20"))      # minimum interval between arrival notifications (s)
+PERSON_BEHAVIOUR_COOLDOWN = float(env("PERSON_BEHAVIOUR_COOLDOWN", "60"))  # per person and behaviour (s)
 PLATE_ALERT_COOLDOWN = float(env("PLATE_ALERT_COOLDOWN", "3600"))
 PLATE_MIN_SCORE = float(env("PLATE_MIN_SCORE", "0.7"))
 PLATES = env("PLATES", "1") == "1"
@@ -64,23 +69,23 @@ RECORD_POST_ROLL = float(env("RECORD_POST_ROLL", "10"))
 RECORD_KEEP_DAYS = int(env("RECORD_KEEP_DAYS", "30"))
 POSE = env("POSE", "1") == "1"
 POSE_MODEL = env("POSE_MODEL", "/models/rtmpose-m.onnx")
-LOW_SCORE = float(env("LOW_SCORE", "0.25"))  # weaker detections accepted only for people already tracked
+LOW_SCORE = float(env("LOW_SCORE", "0.25"))  # lower threshold, applied only to existing tracks
 LOITER_SECONDS = float(env("LOITER_SECONDS", "120"))
 BEHAVIOUR_ALERTS = {b.strip() for b in env("BEHAVIOUR_ALERTS", "lying down,climbing,restricted zone,loitering").split(",")}
 BEHAVIOUR_ALERT_COOLDOWN = float(env("BEHAVIOUR_ALERT_COOLDOWN", "120"))
 ZONES_PATH = env("ZONES_PATH", "/settings/zones.yaml")
-SEND_CLIPS = env("SEND_CLIPS", "1") == "1"               # send the video to the phone after an alert
+SEND_CLIPS = env("SEND_CLIPS", "1") == "1"               # attach the recording after an alert
 CLIP_MAX_SECONDS = float(env("CLIP_MAX_SECONDS", "90"))
-CLIP_MAX_MB = float(env("CLIP_MAX_MB", "14"))            # ntfy.sh allows 15 MB per file
-GONE_AFTER = 5.0  # seconds out of view before a person/vehicle's log entry is finalised
+CLIP_MAX_MB = float(env("CLIP_MAX_MB", "14"))            # ntfy.sh attachment limit is 15 MB
+GONE_AFTER = 5.0  # seconds unseen before a track's log entry is closed
 
 PERSON_COLOURS = [(0, 200, 255), (255, 120, 0), (200, 0, 255), (255, 255, 0), (255, 0, 160), (120, 255, 120)]
 VEHICLE_COLOURS = {"known": (0, 200, 0), "unknown": (0, 0, 255), "checking": (0, 215, 255), "no-plate": (180, 180, 180)}
 
 
-# ---------------------------------------------------------------- video in
+# ---------------------------------------------------------------- video input
 class FrameGrabber(threading.Thread):
-    """Reads the camera continuously and keeps only the newest frame (so we never lag behind live)."""
+    """Reads the stream continuously and retains only the latest frame, so processing never falls behind live."""
 
     def __init__(self, url: str):
         super().__init__(daemon=True)
@@ -138,7 +143,8 @@ def _label(img, text, x, y, colour, scale):
 
 def draw(frame: np.ndarray, people: list[dict], vehicles: list[dict], width: int = DISPLAY_WIDTH,
          zones: list[dict] | None = None) -> np.ndarray:
-    """New image `width` wide with every box drawn (boxes are in `frame` pixels)."""
+    """Return a copy of `frame` resized to `width` with zones, boxes, labels and skeletons drawn.
+    Box and keypoint coordinates are in `frame` pixels."""
     f = width / frame.shape[1]
     img = cv2.resize(frame, (width, int(round(frame.shape[0] * f))),
                      interpolation=cv2.INTER_AREA if f < 1 else cv2.INTER_LINEAR)
@@ -191,14 +197,14 @@ def draw(frame: np.ndarray, people: list[dict], vehicles: list[dict], width: int
 
 
 def render_loop(grabber: FrameGrabber, state: LiveState, recorder: Recorder | None) -> None:
-    """Draws the latest boxes on the newest frame → live view + recording with boxes."""
+    """Renders annotated frames for the live view and the annotated recording."""
     period, last_seq, last_raw = 1.0 / DISPLAY_FPS, -1, 0.0
     while True:
         t0 = time.time()
         frame, seq = grabber.latest()
         if frame is not None and seq != last_seq:
             last_seq = seq
-            if t0 - last_raw > 2:  # plain picture (no boxes) for drawing zones on the dashboard
+            if t0 - last_raw > 2:  # unannotated still used by the zone editor
                 last_raw = t0
                 small = cv2.resize(frame, (DISPLAY_WIDTH, int(frame.shape[0] * DISPLAY_WIDTH / frame.shape[1])),
                                    interpolation=cv2.INTER_AREA)
@@ -248,9 +254,9 @@ def plate_fields(info) -> dict:
             "registered": d.get("registered", ""), "colour": info.colour, "status": info.status, "owner": info.owner}
 
 
-# ---------------------------------------------------------------- video to phone
+# ---------------------------------------------------------------- clip notifications
 def send_clip(notifier: Notifier, db: DB, clip: str, seconds: float) -> None:
-    """After a recording that triggered an alert: send the video (with boxes) to the phone."""
+    """Send the annotated recording of a clip that produced an alert, reduced to fit the attachment limit."""
     from pathlib import Path
     try:
         src = Path(RECORDINGS_DIR) / clip
@@ -282,8 +288,10 @@ def to_detections(dets):
 
 
 def tracked(tracks, current=None, last_fresh=None, now=0.0, keep=1.0):
-    """Tracked objects to show. A track not matched to a detection this frame (person just left or
-    hidden) is kept for `keep` seconds so boxes don't flicker, then hidden. Yields (track, box, score, fresh)."""
+    """Yield (track, box, score, fresh) for active tracks.
+
+    `fresh` is True when the track was matched to a detection in the current frame. Unmatched
+    tracks are shown for up to `keep` seconds to avoid flicker, then suppressed."""
     ids = {id(d) for d in current} if current is not None else None
     for t in tracks:
         if t.last_detection is None or t.id is None:
@@ -334,9 +342,9 @@ def main() -> None:
     zone_store = ZoneStore(ZONES_PATH)
     last_behaviour_alert: dict[str, float] = {}
     prev_person_boxes: list = []
-    last_fresh: dict[int, float] = {}    # people: track id → last time the detector really saw them
-    last_fresh_v: dict[int, float] = {}  # vehicles: same
-    last_state: dict[int, dict] = {}     # people: last behaviour state, shown while briefly hidden
+    last_fresh: dict[int, float] = {}    # person track id -> time of last matched detection
+    last_fresh_v: dict[int, float] = {}  # vehicle track id -> time of last matched detection
+    last_state: dict[int, dict] = {}     # person track id -> last behaviour state
 
     hit_max = int(FPS * 3)
     people_tracker = Tracker(distance_function="iou", distance_threshold=0.75, initialization_delay=2, hit_counter_max=hit_max)
@@ -353,8 +361,8 @@ def main() -> None:
     recorder = Recorder(STREAM_URL, RECORDINGS_DIR, post_roll=RECORD_POST_ROLL, keep_days=RECORD_KEEP_DAYS,
                         keep_raw=RECORD_KEEP_RAW) if RECORD else None
     rec_row = None
-    clip_alerted = False   # was an alert sent during the current recording? then the video goes to the phone
-    # open log rows for people/vehicles currently being tracked: track id -> {"id", "max", "seen"}
+    clip_alerted = False   # whether the current clip produced an alert
+    # track id -> {"id": event row, "max": best confidence, "seen": last seen}
     people_rows: dict[int, dict] = {}
     vehicle_rows: dict[int, dict] = {}
 
@@ -381,13 +389,13 @@ def main() -> None:
                      frame.shape[1], frame.shape[0], grabber.fps, grabber.lag, grabber.skips)
         dets = detector.detect(frame)
         now, ts = datetime.now(), time.time()
-        # strong detections always count; weak ones only if they overlap someone already tracked
-        # (keeps hold of a person who falls or crouches, when the detector is less sure)
+        # Low-confidence person detections are kept only when they overlap an existing track.
+        # This maintains tracking through postures the detector is less certain about (e.g. after a fall).
         person_dets = [d for d in dets if d[5] == PERSON and
                        (d[4] >= MIN_SCORE or any(iou(d[:4], b) > 0.3 for b in prev_person_boxes))]
         dets = [d for d in dets if d[5] != PERSON and d[4] >= MIN_SCORE]
 
-        # ---- track people + vehicles
+        # ---- tracking
         people, vehicles, decided, behaviour_events = [], [], [], []
         zones = zone_store.get()
         pdets = to_detections(person_dets)
@@ -395,7 +403,7 @@ def main() -> None:
             num, _ = person_nums.number_for(t.id, now)
             people.append({"number": num, "box": box, "score": score, "tid": t.id, "fresh": fresh})
         prev_person_boxes = [p["box"] for p in people if p["fresh"]]
-        seen = [p for p in people if p["fresh"]]  # pose + behaviour only from what the detector saw this frame
+        seen = [p for p in people if p["fresh"]]  # behaviour is derived from matched detections only
         poses = pose.estimate(frame, [p["box"] for p in seen]) if pose is not None and seen else []
         cam_offset, jumped = camera_motion.update(frame)
         if jumped:
@@ -411,7 +419,7 @@ def main() -> None:
             last_state[p["tid"]] = {k: p[k] for k in ("doing", "alerts", "zones", "seconds", "speed", "restricted", "kpts") if k in p}
             behaviour_events += [(p, b) for b in new]
         for p in people:
-            if not p["fresh"]:  # briefly hidden: keep showing what they were last doing
+            if not p["fresh"]:  # temporarily unmatched: show last known state
                 p.update(last_state.get(p["tid"], {}))
                 p.pop("kpts", None)
         vdets = to_detections([d for d in dets if d[5] in VEHICLES])
@@ -434,7 +442,7 @@ def main() -> None:
             state.people, state.vehicles = people, vehicles
             state.zones = [{"name": z.name, "type": z.kind, "points": z.points} for z in zones]
 
-        # ---- recording (start before logging so new rows point at the clip)
+        # ---- recording (started before logging so new events reference the clip)
         if recorder is not None:
             thumb = b""
             if (people or vehicles) and not recorder.recording:
@@ -458,7 +466,7 @@ def main() -> None:
                 state.recording = recorder.clip
         clip = recorder.clip if recorder is not None else ""
 
-        # ---- activity log: one row per person / vehicle, kept up to date
+        # ---- event log: one row per tracked person / vehicle
         new_people = []
         for p in people:
             row = people_rows.get(p["tid"])
@@ -482,7 +490,7 @@ def main() -> None:
             else:
                 row["seen"], row["max"] = ts, max(row["max"], v["score"])
 
-        # vehicles gone for a while: final plate decision (or record that no plate was read)
+        # vehicles no longer in view: final plate decision
         with book_lock:
             current = {v["tid"] for v in vehicles}
             for tid in [k for k in book.items
@@ -494,7 +502,7 @@ def main() -> None:
                     db.update("events", vehicle_rows[tid]["id"], **plate_fields(info))
                 book.forget(tid)
 
-        # plate decisions → log + alert
+        # plate decisions: log and notify
         for tid, num, info in decided:
             fields = plate_fields(info)
             if tid in vehicle_rows:
@@ -511,7 +519,7 @@ def main() -> None:
                               info.photo_jpeg or info.crop_jpeg, "rotating_light")
                 clip_alerted = True
 
-        # people / vehicles out of view for a while → finalise their log rows
+        # close log entries for tracks no longer in view
         for rows in (people_rows, vehicle_rows):
             for tid in [k for k, r in rows.items() if ts - r["seen"] > GONE_AFTER]:
                 r = rows.pop(tid)
@@ -524,7 +532,7 @@ def main() -> None:
                 db.update("events", r["id"], confidence=round(r["max"], 3),
                           last_seen=stamp(datetime.fromtimestamp(r["seen"])))
 
-        # ---- behaviours: log each one and add to the person's row
+        # ---- behaviour events
         alerts_on = switches.get("person_alerts") and in_hours(alert_hours, now.time())
         behaviour_alerts = []
         for p, b in behaviour_events:
@@ -543,8 +551,8 @@ def main() -> None:
             log.info("Person %d: %s", p["number"], label)
             kind = "restricted zone" if zone and zone.kind == "restricted" else b
             if zone is not None and zone.kind != "restricted":
-                continue  # watch zones are log-only
-            # alert on it (switch on) – unless their "person seen" alert is about to go out and will say it anyway
+                continue  # watch zones are logged without notification
+            # notify, unless a pending arrival notification will already report it
             if alerts_on and (kind in BEHAVIOUR_ALERTS or not alerter.is_pending(p["tid"])) \
                     and alerter.behaviour_ok(p["number"], b, ts):
                 behaviour_alerts.append((p, label, serious))
@@ -568,7 +576,7 @@ def main() -> None:
                           + f"\n{CAMERA} - {now:%d %b %H:%M:%S}", photo(), "warning" if serious else "bust_in_silhouette",
                           priority="urgent" if serious else "high")
 
-        # ---- "person seen" alert: everyone who has turned up, with what they're doing and the boxed photo
+        # ---- arrival notifications (grouped, with current behaviour and annotated image)
         due = alerter.due(ts, {p["tid"] for p in people})
         if due and alerts_on:
             by_tid = {p["tid"]: p for p in people}

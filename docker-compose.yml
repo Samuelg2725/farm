@@ -1,10 +1,10 @@
 services:
   frigate:
-    image: ghcr.io/blakeblackshear/frigate:0.16.1   # check for newer stable release
+    image: ghcr.io/blakeblackshear/frigate:0.16.1
     container_name: frigate
     restart: unless-stopped
     shm_size: "512mb"
-    # Uncomment on an Intel mini PC for hardware video decode + OpenVINO detection:
+    # Intel iGPU: enable for hardware decoding and OpenVINO detection
     # devices:
     #   - /dev/dri/renderD128:/dev/dri/renderD128
     volumes:
@@ -15,8 +15,8 @@ services:
         tmpfs:
           size: 1000000000
     ports:
-      - "8971:8971"   # Frigate web UI (HTTPS, login required)
-      - "8554:8554"   # RTSP restream (optional)
+      - "8971:8971"   # Frigate UI (HTTPS)
+      - "8554:8554"   # RTSP restream
     environment:
       TZ: ${TZ:-Europe/London}
       FRIGATE_CAM_IP: ${CAM_IP}
@@ -30,10 +30,9 @@ services:
     restart: unless-stopped
     volumes:
       - ./mosquitto/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
-    # Not exposed outside the Docker network on purpose.
+    # internal only; not published to the host
 
-
-  # Open-source push notifications (phone app: "ntfy" on Android / iOS / F-Droid)
+  # Self-hosted notification server (optional; used when NTFY_SERVER=http://ntfy)
   ntfy:
     image: binwiederhier/ntfy:v2.11.0
     container_name: ntfy
@@ -43,14 +42,14 @@ services:
       TZ: ${TZ:-Europe/London}
       NTFY_BASE_URL: http://${HOST_IP:-localhost}:8080
       NTFY_ATTACHMENT_CACHE_DIR: /var/cache/ntfy/attachments
-      NTFY_ATTACHMENT_FILE_SIZE_LIMIT: 50M     # room for video clips
+      NTFY_ATTACHMENT_FILE_SIZE_LIMIT: 50M
       NTFY_ATTACHMENT_EXPIRY_DURATION: 24h
     volumes:
       - ./data/ntfy:/var/cache/ntfy
     ports:
       - "8080:80"
 
-  # People + vehicle tracking, number plates, recordings, alerts – dashboard: http://localhost:8090
+  # Detection, tracking, plate recognition, recording, notifications and dashboard (port 8090)
   vision:
     build: ./vision
     container_name: vision
@@ -58,32 +57,32 @@ services:
     environment:
       TZ: ${TZ:-Europe/London}
       CAMERA: yard_ptz
-      STREAM_URL: rtsp://frigate:8554/yard_ptz   # 4K main stream: live view, detection and plates
-      DISPLAY_WIDTH: "1920"            # live view size: 1920 = 1080p, 2560 = 1440p, 3840 = full 4K
-      DISPLAY_FPS: "12"                # live view refresh rate
-      NTFY_SERVER: ${NTFY_SERVER:-https://ntfy.sh}   # https://ntfy.sh = phones anywhere; http://ntfy = this computer only
-      NTFY_TOPIC: ${NTFY_TOPIC:-}                     # blank = a private random topic is made for you
-      NTFY_PUBLIC_URL: ${NTFY_PUBLIC_URL:-}           # only for http://ntfy: what phones use, e.g. http://10.1.0.50:8080
-      PERSON_ALERTS: "1"               # person alerts on at first start (then use the dashboard button)
-      PERSON_ALERT_HOURS: ${PERSON_ALERT_HOURS:-always}   # while ON, only alert in these hours, e.g. 18:00-07:00
-      PERSON_ALERT_GAP: "20"           # min seconds between "person seen" alerts (new arrivals are grouped)
-      SEND_CLIPS: "1"                  # after an alert, send the video clip (with boxes) to the phone
-      PLATE_ALERT_COOLDOWN: "3600"     # don't re-alert the same unknown plate within an hour
-      PLATE_MIN_SCORE: "0.7"           # how sure a plate read must be before deciding
-      FPS: "5"                         # detections per second
-      POSE: "1"                        # body pose → guess what people are doing
-      LOITER_SECONDS: "120"            # "loitering" after this long in view
-      BEHAVIOUR_ALERTS: "lying down,climbing,restricted zone,loitering"   # marked urgent (others still alert while ON)
+      STREAM_URL: rtsp://frigate:8554/yard_ptz   # main stream via Frigate restream
+      DISPLAY_WIDTH: "1920"            # live view width in pixels
+      DISPLAY_FPS: "12"                # live view frame rate
+      NTFY_SERVER: ${NTFY_SERVER:-https://ntfy.sh}   # https://ntfy.sh or http://ntfy (self-hosted)
+      NTFY_TOPIC: ${NTFY_TOPIC:-}                     # empty: generate a random private topic
+      NTFY_PUBLIC_URL: ${NTFY_PUBLIC_URL:-}           # self-hosted only: URL reachable by client devices
+      PERSON_ALERTS: "1"               # initial state of the dashboard person-alert switch
+      PERSON_ALERT_HOURS: ${PERSON_ALERT_HOURS:-always}   # active hours, e.g. 18:00-07:00
+      PERSON_ALERT_GAP: "20"           # minimum seconds between arrival notifications
+      SEND_CLIPS: "1"                  # attach the annotated clip after an alert
+      PLATE_ALERT_COOLDOWN: "3600"     # seconds before re-notifying the same unknown plate
+      PLATE_MIN_SCORE: "0.7"           # minimum plate read confidence
+      FPS: "5"                         # detection rate
+      POSE: "1"                        # pose-based behaviour classification
+      LOITER_SECONDS: "120"            # loitering threshold (s)
+      BEHAVIOUR_ALERTS: "lying down,climbing,restricted zone,loitering"   # sent with urgent priority
       WHITELIST_PATH: /settings/whitelist.yaml
       DB_PATH: /data/vision.db
-      RECORD: "1"                      # save 4K video while a person/vehicle is in view
-      RECORD_POST_ROLL: "10"           # keep recording this many seconds after they leave
-      RECORD_KEEP_RAW: "1"             # also keep the original 4K video (no boxes) next to each clip
-      RECORD_KEEP_DAYS: "30"           # delete recordings older than this
+      RECORD: "1"                      # record while people or vehicles are in view
+      RECORD_POST_ROLL: "10"           # seconds recorded after the scene clears
+      RECORD_KEEP_RAW: "1"             # also keep the original stream (stream copy)
+      RECORD_KEEP_DAYS: "30"           # retention (days)
     volumes:
-      - ./settings:/settings          # whitelist.yaml + zones.yaml (zones are saved from the dashboard)
+      - ./settings:/settings          # whitelist.yaml, zones.yaml
       - ./data:/data
-      - ./recordings:/recordings       # recordings/YYYY-MM-DD/HH-MM-SS.mp4 (with boxes) + _4k.mp4 (original)
+      - ./recordings:/recordings
     ports:
       - "8090:8090"
     depends_on: [frigate, ntfy]

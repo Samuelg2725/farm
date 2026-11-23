@@ -1,4 +1,4 @@
-"""Pictures and videos made for the phone."""
+"""Notification media: plate images and size-limited video clips."""
 from __future__ import annotations
 
 import logging
@@ -12,7 +12,7 @@ log = logging.getLogger("vision")
 
 
 def plate_photo(vehicle_bgr: np.ndarray, plate_box, plate_text: str = "", width: int = 1280) -> bytes:
-    """The vehicle, with an enlarged close-up of its number plate inset at the top-left."""
+    """Vehicle image with the number plate highlighted and an enlarged inset at the top-left."""
     h, w = vehicle_bgr.shape[:2]
     f = width / w
     img = cv2.resize(vehicle_bgr, (width, int(h * f)), interpolation=cv2.INTER_AREA if f < 1 else cv2.INTER_CUBIC)
@@ -44,15 +44,17 @@ def duration(path: Path) -> float:
 
 
 def phone_clip(src: Path, dst: Path, max_seconds: float = 90, max_mb: float = 14) -> Path | None:
-    """Copy of a recording small enough to send to a phone (ntfy.sh allows 15 MB per file).
-    Uses the clip as-is if it already fits, otherwise re-encodes at 720p (and shortens if very long)."""
+    """Return a version of `src` within `max_mb` and `max_seconds`.
+
+    The original is returned if it already meets the limits; otherwise it is re-encoded to
+    720p at a bitrate derived from the size limit and truncated to `max_seconds`."""
     if not src.is_file():
         return None
     length = duration(src)
     if src.stat().st_size <= max_mb * 1e6 and length <= max_seconds:
         return src
     secs = min(length or max_seconds, max_seconds)
-    # bitrate that fits the size limit (leave 10% headroom), capped at a sensible quality
+    # target bitrate for the size limit with 10% headroom
     kbps = int(min(2500, max(250, max_mb * 8000 * 0.9 / max(secs, 1))))
     cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", str(src), "-t", f"{secs:.1f}",
            "-vf", "scale=-2:720", "-c:v", "libx264", "-preset", "veryfast", "-b:v", f"{kbps}k",

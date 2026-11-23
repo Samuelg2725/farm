@@ -1,5 +1,4 @@
-"""Body pose (17 points: nose, eyes, ears, shoulders, elbows, wrists, hips, knees, ankles)
-with RTMPose-m (Apache-2.0, OpenMMLab) via ONNX Runtime. Runs on each person box we already track."""
+"""Top-down human pose estimation (17 COCO keypoints) using RTMPose-m (Apache-2.0) on ONNX Runtime."""
 from __future__ import annotations
 
 import cv2
@@ -42,7 +41,7 @@ class PoseEstimator:
         self.sess = ort.InferenceSession(model_path, opts, providers=["CPUExecutionProvider"])
 
     def estimate(self, frame_bgr: np.ndarray, boxes: list) -> list[tuple[np.ndarray, np.ndarray]]:
-        """For each box → (keypoints (17, 2) in frame pixels, scores (17,)). Scores above ~0.3 are usable."""
+        """Return (keypoints (17, 2) in frame pixels, scores (17,)) for each box."""
         if not boxes:
             return []
         crops, metas = [], []
@@ -57,7 +56,7 @@ class PoseEstimator:
         for i, (c, s) in enumerate(metas):
             x, y = sx[i].argmax(1), sy[i].argmax(1)
             score = np.minimum(sx[i].max(1), sy[i].max(1))
-            pts = np.stack([x / 2.0, y / 2.0], 1).astype(np.float32)  # simcc split ratio 2
+            pts = np.stack([x / 2.0, y / 2.0], 1).astype(np.float32)  # SimCC split ratio
             m = affine(c, s, inverse=True)
             pts = pts @ m[:, :2].T + m[:, 2]
             out.append((pts, score))

@@ -1,18 +1,18 @@
-"""People + vehicle detection with YOLOX (Apache-2.0) via ONNX Runtime – one pass finds both."""
+"""Person and vehicle detection using YOLOX-S (Apache-2.0) on ONNX Runtime."""
 from __future__ import annotations
 
 import cv2
 import numpy as np
 import onnxruntime as ort
 
-# COCO class ids we care about
+# COCO class ids
 PERSON = 0
 VEHICLES = {2: "car", 3: "motorcycle", 5: "bus", 7: "truck"}
 CLASSES = (PERSON, *VEHICLES)
 
 
 def letterbox(img: np.ndarray, size: tuple[int, int]) -> tuple[np.ndarray, float]:
-    """Resize keeping aspect ratio, pad with grey (114) – YOLOX's expected input."""
+    """Resize preserving aspect ratio and pad with value 114, as expected by YOLOX."""
     h, w = img.shape[:2]
     r = min(size[0] / h, size[1] / w)
     resized = cv2.resize(img, (int(w * r), int(h * r)), interpolation=cv2.INTER_LINEAR)
@@ -47,7 +47,7 @@ def decode(raw: np.ndarray, grids: np.ndarray, strides: np.ndarray, ratio: float
     cls_ids = np.array(classes)[best[keep]]
     x1y1 = (xy - wh / 2) / ratio
     wh = wh / ratio
-    # NMS per group (people vs vehicles) so a person next to a car isn't suppressed
+    # NMS is applied separately to people and vehicles so overlapping objects of different types are kept
     group = np.where(cls_ids == PERSON, 0, 1)
     idx = cv2.dnn.NMSBoxesBatched(np.hstack([x1y1, wh]).tolist(), scores.tolist(), group.tolist(), conf, nms)
     out = []

@@ -1,8 +1,7 @@
-# Vehicles allowed on site. Anything not here triggers an alert.
-# Edits are picked up automatically – no restart needed.
-# Spaces and upper/lower case don't matter.
+# Authorised vehicles. Plates not listed here generate an alert.
+# Changes are applied automatically. Spacing and letter case are ignored.
 vehicles:
   - plate: AB12 CDE
-    owner: Example – owner's car (replace me)
+    owner: Example vehicle
   # - plate: YX19 ABC
-  #   owner: Livestock haulier – J Smith
+  #   owner: Livestock haulier

@@ -1,4 +1,4 @@
-"""Zones drawn on the dashboard, saved in settings/zones.yaml."""
+"""Persistence for zones defined in the dashboard (settings/zones.yaml)."""
 from __future__ import annotations
 
 import logging
@@ -47,9 +47,9 @@ class ZoneStore:
             kind = z.get("type", "restricted") if z.get("type") in ("restricted", "watch") else "restricted"
             clean.append({"name": str(z["name"]).strip()[:40], "type": kind,
                           "hours": str(z.get("hours") or "always").strip(), "points": pts})
-        header = ("# Zones drawn on the dashboard (Zones tab). Points are fractions of the picture (0-1).\n"
-                  "# type: restricted = alert when someone enters, watch = log only.\n"
-                  "# hours: always, or a time range like 18:00-07:00\n")
+        header = ("# Zones defined in the dashboard. Points are normalised image coordinates (0-1).\n"
+                  "# type: restricted (notify on entry) or watch (log only)\n"
+                  "# hours: always, or a time range such as 18:00-07:00\n")
         with self.lock:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             self.path.write_text(header + yaml.safe_dump({"zones": clean}, sort_keys=False))
