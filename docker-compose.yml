@@ -32,6 +32,7 @@ services:
       - ./mosquitto/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
     # Not exposed outside the Docker network on purpose.
 
+
   # Open-source push notifications (phone app: "ntfy" on Android / iOS / F-Droid)
   ntfy:
     image: binwiederhier/ntfy:v2.11.0
@@ -47,43 +48,27 @@ services:
     ports:
       - "8080:80"
 
-  plate-watcher:
-    build: ./plate-watcher
-    container_name: plate-watcher
-    restart: unless-stopped
-    environment:
-      TZ: ${TZ:-Europe/London}
-      MQTT_HOST: mqtt
-      FRIGATE_URL: http://frigate:5000
-      NTFY_URL: http://ntfy/${NTFY_TOPIC:-farm-alerts}
-      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN}
-      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID}
-      WHITELIST_PATH: /app/whitelist.yaml
-      DB_PATH: /data/sightings.db
-      OWN_ALPR: "1"                       # free FastALPR on 4K frames
-      STREAM_URL: rtsp://frigate:8554/{camera}
-      DETECT_SIZE: 640x360                # must match detect width x height in Frigate config
-    volumes:
-      - ./plate-watcher/whitelist.yaml:/app/whitelist.yaml:ro
-      - ./data:/data
-    depends_on: [mqtt, frigate, ntfy]
-
-  # Live view with numbered boxes round each person + person alerts
-  people-tracker:
-    build: ./people-tracker
-    container_name: people-tracker
+  # People tracking + number plate checks together, one live view: http://localhost:8090
+  vision:
+    build: ./vision
+    container_name: vision
     restart: unless-stopped
     environment:
       TZ: ${TZ:-Europe/London}
       CAMERA: yard_ptz
-      STREAM_URL: rtsp://frigate:8554/yard_ptz_sub   # low-res stream via Frigate
+      STREAM_URL: rtsp://frigate:8554/yard_ptz_sub   # low-res: people + vehicle detection
+      MAIN_URL: rtsp://frigate:8554/yard_ptz         # 4K: number plate reading
       NTFY_URL: http://ntfy/${NTFY_TOPIC:-farm-alerts}
       PERSON_ALERT_HOURS: ${PERSON_ALERT_HOURS:-always}   # always | never | 18:00-07:00
-      PERSON_ALERT_COOLDOWN: "300"                        # seconds between person alerts
+      PERSON_ALERT_COOLDOWN: "300"     # seconds between person alerts
+      PLATE_ALERT_COOLDOWN: "3600"     # don't re-alert the same unknown plate within an hour
+      PLATE_MIN_SCORE: "0.7"           # how sure a plate read must be before deciding
       FPS: "5"
-      DB_PATH: /data/people.db
+      WHITELIST_PATH: /settings/whitelist.yaml
+      DB_PATH: /data/vision.db
     volumes:
+      - ./settings:/settings:ro
       - ./data:/data
     ports:
-      - "8090:8090"   # live view: http://localhost:8090
+      - "8090:8090"
     depends_on: [frigate, ntfy]

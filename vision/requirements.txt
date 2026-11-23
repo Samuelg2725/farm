@@ -1,5 +1,7 @@
+fast-alpr==0.4.0
 norfair==2.3.0
 numpy==1.26.4
 opencv-python-headless==4.10.0.84
 onnxruntime==1.20.1
 requests==2.32.3
+PyYAML==6.0.2

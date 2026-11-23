@@ -19,14 +19,10 @@ detectors:
   cpu1:
     type: cpu
 
-# Licence plate recognition (runs on detected cars)
+# Number plates are read by our "vision" service (FastALPR on 4K frames),
+# so Frigate's own plate reader is off to save CPU.
 lpr:
-  enabled: true
-  min_plate_length: 4
-  recognition_threshold: 0.85
-  # UK current-style plates only (AB12CDE). Leave off while testing – private
-  # and older plates would be ignored.
-  # format: "^[A-Z]{2}[0-9]{2}[A-Z]{3}$"
+  enabled: false
 
 objects:
   track: [person, car, truck, motorcycle]
@@ -66,8 +62,6 @@ cameras:
       width: 640      # set to your sub stream resolution
       height: 360
       fps: 5
-    lpr:
-      enabled: true
     # PTZ control from the Frigate UI. Use the camera's own auto-tracking
     # (Reolink app) – Frigate's autotracker needs ONVIF features Reolink lacks.
     onvif:

@@ -1,6 +1,6 @@
 from datetime import datetime, time
 
-from people_tracker.logic import AlertPolicy, DailyNumbers, in_hours, parse_hours
+from vision.logic import AlertPolicy, DailyNumbers, in_hours, parse_hours
 
 
 def test_numbers_sequential_and_reset_daily():

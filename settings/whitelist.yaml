@@ -1,5 +1,6 @@
 # Vehicles allowed on site. Anything not here triggers an alert.
 # Edits are picked up automatically – no restart needed.
+# Spaces and upper/lower case don't matter.
 vehicles:
   - plate: AB12 CDE
     owner: Example – owner's car (replace me)

@@ -6,16 +6,24 @@ Everything is **free and open source**, and runs on site with no cloud and no su
 
 | Part | Job | Licence |
 |---|---|---|
-| [Frigate](https://github.com/blakeblackshear/frigate) | records, detects people & vehicles, draws boxes, PTZ control | MIT |
-| [FastALPR](https://github.com/ankandrew/fast-alpr) (inside plate-watcher) | finds + reads number plates from full 4K frames | MIT |
-| people-tracker (our code) | live view with **numbered boxes** (Person 1, 2, 3…) + person alerts | ours |
-| ├ [YOLOX](https://github.com/Megvii-BaseDetection/YOLOX) | person detector used by people-tracker | Apache-2.0 |
-| └ [Norfair](https://github.com/tryolabs/norfair) | follows each person between frames (same tracker Frigate uses) | BSD-3 |
-| plate-watcher (our code) | checks plates against `whitelist.yaml`, logs every vehicle, alerts on unknowns | ours |
+| **vision** (our code) | ONE live view that does **both at once**: numbered boxes round people (Person 1, 2…) **and** boxes round vehicles with their number plate + KNOWN / UNKNOWN. Sends alerts. | ours |
+| ├ [YOLOX](https://github.com/Megvii-BaseDetection/YOLOX) | finds people **and** vehicles in one pass | Apache-2.0 |
+| ├ [Norfair](https://github.com/tryolabs/norfair) | follows each person/vehicle between frames so they keep their number | BSD-3 |
+| └ [FastALPR](https://github.com/ankandrew/fast-alpr) | finds + reads the number plate from a 4K crop of each vehicle | MIT |
+| [Frigate](https://github.com/blakeblackshear/frigate) | records 24/7, review/playback of events, PTZ control | MIT |
 | [ntfy](https://github.com/binwiederhier/ntfy) | push alerts with photo to phones | Apache-2.0 / GPL-2.0 |
-| Mosquitto | message bus between them | EPL/EDL |
+| [Mosquitto](https://github.com/eclipse-mosquitto/mosquitto) | message bus Frigate uses | EPL/EDL |
 
-How a plate gets read: Frigate spots a moving car on the low-res stream → plate-watcher grabs a **4K frame**, crops round the car, FastALPR finds and reads the plate → it's checked against the whitelist (allowing 1 misread character) → unknown = alert. Frigate's own built-in plate reader also feeds in as a second opinion.
+How it works, every frame (5 per second):
+
+```
+camera low-res stream ─► YOLOX finds people + vehicles ─► Norfair tracks them
+      │                                                     │
+      │                         people ──► "Person 1, 2, 3…" boxes  ──► person alert
+      │                         vehicles ─► "Vehicle 1" box
+camera 4K stream ─► crop round each vehicle ─► FastALPR reads plate ─► whitelist check
+                                                    ─► green "OK owner"  or  red "UNKNOWN!" + alert
+```
 
 ---
 
@@ -60,7 +68,7 @@ sudo usermod -aG docker $USER   # then log out and back in
 Copy this folder onto the PC, then:
 
 ```bash
-cd farm-security
+cd farm
 ```
 
 ```bash
@@ -93,26 +101,33 @@ Open **https://PC-IP:8971** (accept the certificate warning), log in as `admin`,
 
 ## 4. What you'll see
 
-- **Live view** with people/vehicles detected.
+- **Frigate** (https://localhost:8971): recordings, live camera, PTZ arrows.
 - **Debug view** (camera → ⋮ → Debug → *Bounding boxes*) shows the boxes round each person/vehicle live.
 - **Review** tab – every alert/detection with clip and snapshot (boxes drawn on).
-- **Explore** – search past objects; recognised plates show as labels on cars.
+- **Explore** – search past objects.
 
-## 5. Live view with numbered people
+## 5. The live view (people + plates together)
 
 Open **http://localhost:8090** (or `http://HOST_IP:8090` from a phone/laptop on the network).
 
-- Every person gets a coloured box labelled **Person 1, Person 2…**; the same person keeps their number while they're in view. Numbers restart each day.
-- Top bar shows the time and how many people are in view.
-- Each new person is logged to `data/people.db`.
-- **Person alerts** go to the ntfy app with the numbered picture. Set when in `.env`:
-  `PERSON_ALERT_HOURS=always`, `never`, or a time range like `18:00-07:00` (out of hours only). Max one alert per 5 minutes so a group doesn't spam you.
+- **People**: coloured box labelled **Person 1, Person 2…** – same person keeps their number while in view. Numbers restart each day.
+- **Vehicles**: box labelled **Vehicle 1** plus the plate once read:
+  - yellow `checking...` – plate read, confirming
+  - green `OK <owner>` – on the whitelist
+  - red `UNKNOWN!` – not on the whitelist → alert sent
+  - grey – no plate visible (e.g. side-on)
+- Top bar: time, number of people and vehicles in view. Lists underneath the picture.
+- Everything is logged to `data/vision.db` (tables `people` and `vehicles`).
 
-Logs: `docker logs -f people-tracker`
+Watch what it's doing:
 
-## 5b. Whitelist (owner's cars)
+```bash
+docker logs -f vision
+```
 
-Edit `plate-watcher/whitelist.yaml`:
+### Owner's cars (whitelist)
+
+Edit `settings/whitelist.yaml` (`open -e settings/whitelist.yaml` on Mac):
 
 ```yaml
 vehicles:
@@ -122,39 +137,35 @@ vehicles:
     owner: Haulier – J Smith
 ```
 
-Spaces/case don't matter. One misread character (e.g. B read as 8) still counts as a match. Changes load automatically.
-
-Watch it working:
-
-```bash
-docker logs -f plate-watcher
-```
+Spaces/case don't matter. One misread character (e.g. B read as 8) still counts as a match. Changes load automatically – no restart.
 
 ## 6. Alerts on your phone (ntfy – free, open source)
 
-1. Set `HOST_IP` (this PC's IP) and `NTFY_TOPIC` (any hard-to-guess name) in `.env`, then `docker compose up -d`.
+1. Set `HOST_IP` (this computer's IP) and `NTFY_TOPIC` (any hard-to-guess name) in `.env`, then `docker compose up -d`.
 2. Install the **ntfy** app (Android Play Store / F-Droid, or iPhone App Store).
 3. In the app: **+** → *Use another server* → `http://HOST_IP:8080` → topic = your `NTFY_TOPIC`.
 4. Test: `curl -d "test alert" http://HOST_IP:8080/farm-alerts` – your phone should buzz.
 
-Unknown plate → photo + plate + time. Same plate won't re-alert for 10 minutes.
-Phones get alerts while on the site Wi-Fi/network. For alerts when away, use a free open-source VPN such as WireGuard back to the site (ask and I'll set it up).
+You get:
+- **UNKNOWN VEHICLE: <plate>** – with a 4K photo of the vehicle. Same plate won't re-alert for an hour.
+- **Person seen: Person 3** – with the numbered live picture. Choose when in `.env`: `PERSON_ALERT_HOURS=always`, `never`, or e.g. `18:00-07:00` (out of hours only). Max one per 5 minutes.
 
-*Optional:* Telegram also works (free but not open source) – fill in `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` (create a bot via @BotFather).
+Phones get alerts while on the site network. For alerts when away, use a free open-source VPN such as WireGuard back to the site.
 
 ## 7. Tuning knobs
 
-`plate-watcher` (set under `environment:` in `docker-compose.yml`):
+`vision` settings (under `environment:` in `docker-compose.yml`, then `docker compose up -d`):
 
 | Setting | Default | Meaning |
 |---|---|---|
-| `MIN_SCORE` | 0.7 | ignore plate reads less confident than this |
-| `MATCH_DISTANCE` | 1 | characters allowed to differ and still match whitelist |
-| `DECISION_DELAY` | 20 | seconds to collect reads before deciding |
-| `ALERT_COOLDOWN` | 600 | seconds before re-alerting the same plate |
-| `GRAB_INTERVAL` / `MAX_GRABS` | 2 / 5 | grab a 4K frame every 2 s, up to 5 per vehicle |
+| `FPS` | 5 | frames per second analysed – lower if the computer struggles |
+| `MIN_SCORE` | 0.45 | how sure the detector must be that it's a person/vehicle |
+| `PLATE_MIN_SCORE` | 0.7 | how sure a plate read must be before deciding known/unknown |
+| `PLATE_ALERT_COOLDOWN` | 3600 | seconds before re-alerting the same unknown plate |
+| `PERSON_ALERT_HOURS` | always | `always` / `never` / `18:00-07:00` |
+| `PERSON_ALERT_COOLDOWN` | 300 | seconds between person alerts |
 | `ALPR_OCR_MODEL` | cct-s-v2-global-model | plate OCR model (global, recognises UK plates) |
-| `OWN_ALPR` | 1 | 0 = only use Frigate's built-in plate reader |
+| `PLATES` | 1 | 0 = turn plate reading off |
 
 **Faster detection on Intel mini PC:** uncomment the `devices:` lines in `docker-compose.yml`, uncomment `hwaccel_args: preset-vaapi`, and replace the `detectors:` block in the Frigate config with:
 
@@ -172,12 +183,13 @@ model:
   labelmap_path: /openvino-model/coco_91cl_bkgr.txt
 ```
 
-**Better free person model (later):** Frigate's bundled model is basic. Once running, it can be swapped for a free YOLOv9 or D-FINE model (open-source weights, exported to ONNX) – see Frigate docs → *Object Detectors*. Best done on the Intel mini PC.
+**Frigate's own detection** (used for its recordings/review) uses a basic bundled model; the live view and alerts come from `vision` (YOLOX). Frigate's model can later be swapped for a free YOLOv9 – see Frigate docs → *Object Detectors*.
 
 ## 8. Known limits / next steps
 
 - **Night plates**: IR makes reflective UK plates glare white. Expect daytime plates to work first; night needs spotlight/shutter tuning or a dedicated fixed plate camera at the gate.
-- **Numbered boxes**: Frigate draws boxes + labels; a live view with a number per person is a later add-on.
+- **Parked cars**: a parked car is read a few times then left alone; if the PTZ moves, vehicles get re-read (unknown plates still only alert once an hour).
+- **People numbers** are per sighting: if someone leaves view for more than ~3 s and comes back, they get a new number (no face recognition, on purpose).
 - **Zones** (gate, yard, lairage) – add once the site layout is known, so alerts only fire where it matters.
 - **Legal (UK GDPR)**: before going live – CCTV/ANPR signage, DPIA for ANPR, ICO registration, retention policy, tell staff. Default retention here: recordings 3 days, events/snapshots 30 days.
 
@@ -188,6 +200,7 @@ model:
 | `check_camera.sh` port 554 closed | RTSP not enabled on camera |
 | Stream FAIL / 401 | wrong user/password, or special characters in password |
 | Frigate shows no video | `docker logs frigate`; check `.env` values |
-| Plates never read | car too small in frame – zoom in more on Preset 1; check Frigate *Explore* for plate labels |
-| No phone alert | `docker logs plate-watcher`; check the ntfy app server address + topic match `.env` |
-| "Could not grab frame" in logs | Frigate restream not running – check Frigate is up and the camera name in the config |
+| Plates never read | plate too small – zoom in so it's ~150 px wide in the 4K image; check `docker logs vision` for `read` lines |
+| No phone alert | `docker logs vision`; check the ntfy app server address + topic match `.env` |
+| "Cannot open" / "Could not grab" in vision logs | Frigate not running yet – `docker compose ps`; it retries automatically |
+| Live view slow / Mac hot | lower `FPS` to 2–3 |
