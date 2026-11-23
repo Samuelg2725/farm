@@ -169,3 +169,19 @@ class Recorder:
                     removed.append(d.name)
                     log.info("Deleted old recordings %s", d.name)
         return removed
+
+
+def free_space(out_dir: str | Path, min_free_gb: float, keep_newest: int = 1) -> list[str]:
+    """Delete the oldest day directories until at least `min_free_gb` is free (newest days are kept)."""
+    out = Path(out_dir)
+    removed = []
+    if not out.exists():
+        return removed
+    days = sorted(d for d in out.iterdir() if d.is_dir())
+    for d in days[:max(0, len(days) - keep_newest)]:
+        if shutil.disk_usage(out).free / 1e9 >= min_free_gb:
+            break
+        shutil.rmtree(d, ignore_errors=True)
+        removed.append(d.name)
+        log.warning("Disk space low: deleted recordings for %s", d.name)
+    return removed

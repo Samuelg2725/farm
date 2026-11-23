@@ -28,11 +28,12 @@ from .behaviour import LABELS, BehaviourAnalyzer, CameraMotion
 from .clips import phone_clip, plate_photo
 from .db import DB
 from .detector import PERSON, VEHICLES, Detector
+from .health import HealthMonitor, disk_space
 from .logic import DailyNumbers, LagMeter, PersonAlerter, in_hours, parse_hours
 from .plateinfo import describe, estimate_colour
 from .plates import PlateBook, PlateReader, Whitelist, crop_scaled
 from .pose import SKELETON, PoseEstimator
-from .recorder import Recorder
+from .recorder import Recorder, free_space
 from .web import App, LiveState, serve
 from .zones import ZoneStore
 
@@ -77,6 +78,9 @@ ZONES_PATH = env("ZONES_PATH", "/settings/zones.yaml")
 SEND_CLIPS = env("SEND_CLIPS", "1") == "1"               # attach the recording after an alert
 CLIP_MAX_SECONDS = float(env("CLIP_MAX_SECONDS", "90"))
 CLIP_MAX_MB = float(env("CLIP_MAX_MB", "14"))            # ntfy.sh attachment limit is 15 MB
+OFFLINE_ALERT_AFTER = float(env("OFFLINE_ALERT_AFTER", "60"))  # seconds without video before notifying
+DISK_MIN_FREE_GB = float(env("DISK_MIN_FREE_GB", "10"))         # below this, notify and remove oldest recordings
+STALE_AFTER = 5.0  # seconds without a new frame before the feed is treated as interrupted
 GONE_AFTER = 5.0  # seconds unseen before a track's log entry is closed
 
 PERSON_COLOURS = [(0, 200, 255), (255, 120, 0), (200, 0, 255), (255, 255, 0), (255, 0, 160), (120, 255, 120)]
@@ -91,6 +95,7 @@ class FrameGrabber(threading.Thread):
         super().__init__(daemon=True)
         self.url, self.frame, self.lock = url, None, threading.Lock()
         self.fps, self.seq, self.lag, self.skips, self.codec = 0.0, 0, 0.0, 0, ""
+        self.last_frame_time: float | None = None
 
     def run(self):
         while True:
@@ -113,6 +118,7 @@ class FrameGrabber(threading.Thread):
                 with self.lock:
                     self.frame = frame
                     self.seq += 1
+                    self.last_frame_time = now
                 pts = cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0
                 if pts > 0:
                     self.lag = meter.update(pts, now)
@@ -127,6 +133,10 @@ class FrameGrabber(threading.Thread):
                     self.fps, t_count, n = n / (now - t_count), now, 0
             cap.release()
             time.sleep(1)
+
+    def stale(self, now: float | None = None) -> bool:
+        t = self.last_frame_time
+        return t is None or (now or time.time()) - t > STALE_AFTER
 
     def latest(self):
         with self.lock:
@@ -198,11 +208,15 @@ def draw(frame: np.ndarray, people: list[dict], vehicles: list[dict], width: int
 
 def render_loop(grabber: FrameGrabber, state: LiveState, recorder: Recorder | None) -> None:
     """Renders annotated frames for the live view and the annotated recording."""
-    period, last_seq, last_raw = 1.0 / DISPLAY_FPS, -1, 0.0
+    period, last_seq, last_raw, last_offline = 1.0 / DISPLAY_FPS, -1, 0.0, 0.0
     while True:
         t0 = time.time()
         frame, seq = grabber.latest()
-        if frame is not None and seq != last_seq:
+        if grabber.stale(t0) and t0 - last_offline >= 1:
+            last_offline = t0
+            with state.lock:
+                state.jpeg = offline_image(frame, grabber.last_frame_time)
+        if frame is not None and seq != last_seq and not grabber.stale(t0):
             last_seq = seq
             if t0 - last_raw > 2:  # unannotated still used by the zone editor
                 last_raw = t0
@@ -223,6 +237,49 @@ def render_loop(grabber: FrameGrabber, state: LiveState, recorder: Recorder | No
                 if recorder is not None and recorder.recording:
                     recorder.feed(jpeg)
         time.sleep(max(0.0, period - (time.time() - t0)))
+
+
+def offline_image(last_frame: np.ndarray | None, last_time: float | None) -> bytes:
+    """Live-view placeholder shown while the camera feed is interrupted."""
+    h = int(DISPLAY_WIDTH * 9 / 16)
+    if last_frame is not None:
+        img = cv2.resize(last_frame, (DISPLAY_WIDTH, int(last_frame.shape[0] * DISPLAY_WIDTH / last_frame.shape[1])))
+        img = (img * 0.35).astype(np.uint8)
+    else:
+        img = np.zeros((h, DISPLAY_WIDTH, 3), np.uint8)
+    scale = img.shape[0] / 720
+    lines = ["CAMERA OFFLINE - reconnecting"]
+    if last_time is not None:
+        lines.append(f"last frame {datetime.fromtimestamp(last_time):%d %b %H:%M:%S}")
+    for i, text in enumerate(lines):
+        size = (1.4 if i == 0 else 0.8) * scale
+        (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, size, 3)
+        org = ((img.shape[1] - tw) // 2, img.shape[0] // 2 + int(i * 60 * scale))
+        cv2.putText(img, text, org, cv2.FONT_HERSHEY_SIMPLEX, size, (60, 60, 255) if i == 0 else (220, 220, 220), 3)
+    ok, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 80])
+    return buf.tobytes() if ok else b""
+
+
+# ---------------------------------------------------------------- health
+def health_loop(grabber: FrameGrabber, notifier: Notifier, state: LiveState, interval: float = 5.0) -> None:
+    """Periodic health checks; sends notifications on state changes and frees disk space when low."""
+    monitor = HealthMonitor(offline_alert_after=OFFLINE_ALERT_AFTER, min_free_gb=DISK_MIN_FREE_GB)
+    while True:
+        try:
+            try:
+                free_gb, total_gb = disk_space(RECORDINGS_DIR)
+            except OSError:
+                free_gb = total_gb = None
+            for a in monitor.check(time.time(), grabber.last_frame_time, grabber.skips, free_gb, total_gb, CAMERA):
+                log.warning("Health: %s - %s", a.title, a.body)
+                notifier.send(a.title, a.body, tags=a.tags, priority=a.priority)
+            if monitor.status.get("low_disk"):
+                free_space(RECORDINGS_DIR, DISK_MIN_FREE_GB)
+            with state.lock:
+                state.health = dict(monitor.status)
+        except Exception:
+            log.exception("Health check failed")
+        time.sleep(interval)
 
 
 # ---------------------------------------------------------------- plates
@@ -375,12 +432,28 @@ def main() -> None:
     grabber = FrameGrabber(STREAM_URL)
     grabber.start()
     threading.Thread(target=render_loop, args=(grabber, state, recorder), daemon=True).start()
+    os.makedirs(RECORDINGS_DIR, exist_ok=True)
+    threading.Thread(target=health_loop, args=(grabber, notifier, state), daemon=True).start()
 
     period, last_log = 1.0 / FPS, 0.0
     while True:
         t0 = time.time()
         frame, _ = grabber.latest()
-        if frame is None:
+        if frame is None or grabber.stale(t0):
+            # feed interrupted: clear the scene and let any recording close after its post-roll
+            with state.lock:
+                state.people, state.vehicles = [], []
+            if recorder is not None and recorder.recording:
+                change = recorder.update(datetime.now(), False)
+                if change and change[0] == "stopped":
+                    if clip_alerted and SEND_CLIPS:
+                        threading.Thread(target=send_clip, args=(notifier, db, change[1]["file"], change[1]["seconds"]),
+                                         daemon=True).start()
+                    if rec_row:
+                        db.update("recordings", rec_row, end=stamp(datetime.now()))
+                        rec_row = None
+                with state.lock:
+                    state.recording = recorder.clip
             time.sleep(0.5)
             continue
         if t0 - last_log > 60:

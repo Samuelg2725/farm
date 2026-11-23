@@ -20,7 +20,8 @@ class LiveState:
         self.lag = 0.0
         self.recording = ""
         self.zones: list[dict] = []
-        self.raw_jpeg: bytes = b""   # unannotated frame for the zone editor
+        self.raw_jpeg: bytes = b""
+        self.health: dict = {}   # unannotated frame for the zone editor
 
 
 class App:
@@ -75,7 +76,8 @@ class Handler(BaseHTTPRequestHandler):
                 body = {"camera": a.camera, "people": a.state.people, "vehicles": a.state.vehicles,
                         "stream_fps": round(a.state.stream_fps, 1), "lag": round(a.state.lag, 1),
                         "recording": a.state.recording, "today": {k: v or 0 for k, v in counts.items()},
-                        "person_alerts": bool(a.switches and a.switches.get("person_alerts"))}
+                        "person_alerts": bool(a.switches and a.switches.get("person_alerts")),
+                        "health": a.state.health}
             return self._json(body)
         if url.path == "/api/events":
             kind = q.get("kind", "")
@@ -238,15 +240,24 @@ dialog::backdrop{background:rgba(0,0,0,.7)}.x{float:right;background:none;border
 .arm.on{background:#16371f;color:#5ee38a;box-shadow:0 0 0 1px #2f8a4c inset}
 .doing{margin-top:4px;font-size:13px}.alarm{color:#fff;background:var(--bad);border-radius:4px;padding:1px 6px;font-size:12px;font-weight:600;margin-left:4px}
 .beh{color:var(--warn)}.beh.alert{color:var(--bad);font-weight:600}
-.zedit{display:flex;gap:16px;flex-wrap:wrap;align-items:flex-start}.zpic{position:relative;flex:1 1 560px;max-width:960px;cursor:crosshair}
-.zpic img{width:100%;display:block;border-radius:6px;background:#000}.zpic svg{position:absolute;inset:0;width:100%;height:100%}
-.zform{flex:0 1 300px;display:flex;flex-direction:column;gap:8px}.zform input,.zform select{background:#222733;color:var(--text);border:1px solid var(--line);border-radius:6px;padding:8px;font:inherit}
+.zedit{display:flex;gap:16px;flex-wrap:wrap;align-items:flex-start}
+.zwrap{flex:1 1 560px;max-width:1100px;min-width:0}
+#zc{width:100%;display:block;border-radius:6px;background:#000;touch-action:none;cursor:crosshair}
+.ztools{display:flex;gap:6px;align-items:center;flex-wrap:wrap;margin-bottom:8px}
+.ztools button{background:#2a303b;color:var(--text);border:0;border-radius:6px;padding:7px 12px;font:inherit;cursor:pointer}
+.ztools button.on{background:var(--accent);color:#fff}
+.zform{flex:0 1 300px;display:flex;flex-direction:column;gap:8px;min-width:240px}
+.zform label{display:flex;flex-direction:column;gap:4px;font-size:12px;color:var(--muted)}
+.zform input,.zform select{background:#222733;color:var(--text);border:1px solid var(--line);border-radius:6px;padding:8px;font:inherit}
 .btn2{background:#2a303b;color:var(--text);border:0;border-radius:6px;padding:8px 12px;font:inherit;cursor:pointer}
-.zlist div{display:flex;justify-content:space-between;align-items:center;padding:6px 0;border-bottom:1px solid var(--line)}
+.btn2.danger{color:var(--bad)}
+.zlist .zi{display:flex;justify-content:space-between;align-items:center;padding:7px 8px;border-radius:6px;cursor:pointer}
+.zlist .zi:hover,.zlist .zi.sel{background:#222733}
+.zdot{display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:6px}
 </style></head><body>
 <header><h1>🐄🐖🐔 Farm Security</h1>
 <span class="pill" id="cam">camera …</span><span class="pill" id="delay">delay …</span>
-<span class="pill rec" id="rec" hidden>● REC</span>
+<span class="pill" id="health">● …</span><span class="pill rec" id="rec" hidden>● REC</span>
 <button id="arm" class="arm" title="Switch phone alerts for people on/off">🔔 Person alerts …</button><span class="spacer"></span>
 <span class="pill">Today: <b id="tp">0</b> people · <b id="tv">0</b> vehicles · <b id="tu" style="color:var(--bad)">0</b> unknown</span>
 </header>
@@ -267,16 +278,22 @@ dialog::backdrop{background:rgba(0,0,0,.7)}.x{float:right;background:none;border
    Private plates can move between cars, so the date is for the plate, not necessarily the car.</p></div>
   <div class="tab" id="recordings"><p class="small muted" id="recinfo"></p><div class="grid"></div></div>
   <div class="tab" id="zones"><div class="zedit">
-   <div class="zpic" id="zpic"><img id="zimg" alt="camera picture"><svg id="zsvg" viewBox="0 0 1 1" preserveAspectRatio="none"></svg></div>
-   <div class="zform"><b>Draw a zone</b><span class="small muted">Click on the picture to add corners (3 or more), then name it and save.
-    Someone is "in" a zone when their feet are inside it.</span>
-    <input id="zname" placeholder="Name, e.g. Lairage, Back fence">
-    <select id="ztype"><option value="restricted">Restricted – alert when someone enters</option><option value="watch">Watch – log only</option></select>
-    <input id="zhours" placeholder="When: always, or e.g. 18:00-07:00" value="always">
-    <div style="display:flex;gap:6px;flex-wrap:wrap"><button class="btn" id="zsave">Save zone</button><button class="btn2" id="zundo">Undo point</button>
-     <button class="btn2" id="zclear">Clear</button><button class="btn2" id="zrefresh">New picture</button></div>
-    <span id="zmsg" class="small"></span><b style="margin-top:10px">Zones</b><div class="zlist" id="zlist"></div></div>
-  </div></div>
+   <div class="zwrap">
+    <div class="ztools"><button data-mode="rect" class="on">▭ Rectangle</button><button data-mode="poly">⬠ Freeform</button>
+     <span class="small muted" id="zhint"></span><span class="spacer"></span><button id="zrefresh">↻ Refresh picture</button></div>
+    <canvas id="zc"></canvas></div>
+   <div class="zform">
+    <div id="zempty" class="small muted">Draw a zone on the picture, or select an existing zone to edit it.</div>
+    <div id="zpanel" hidden style="display:flex;flex-direction:column;gap:8px"><b id="ztitle">New zone</b>
+     <label>Name<input id="zname" placeholder="e.g. Lairage, Back fence" maxlength="40"></label>
+     <label>Type<select id="ztype"><option value="restricted">Restricted – notify on entry</option><option value="watch">Watch – log only</option></select></label>
+     <label>Active hours<input id="zhours" value="always" placeholder="always, or 18:00-07:00"></label>
+     <div style="display:flex;gap:6px;flex-wrap:wrap"><button class="btn" id="zsave">Save</button><button class="btn2" id="zcancel">Cancel</button>
+      <button class="btn2 danger" id="zdelete">Delete</button></div></div>
+    <span id="zmsg" class="small"></span>
+    <b style="margin-top:6px">Zones</b><div class="zlist" id="zlist"></div>
+    <span class="small muted">Drag corners to reshape, drag inside to move.<br>Enter: finish · Esc: cancel · Backspace: remove last point · Delete: remove zone</span>
+   </div></div></div>
   <div class="tab" id="alerts"><div class="steps">
    <div class="qr" id="qr"></div>
    <ol><li>Install the free <b>ntfy</b> app (App Store / Google Play).</li>
@@ -305,7 +322,7 @@ async function j(u,o){const r=await fetch(u,o);return r.json()}
 
 async function status(){try{const s=await j('/api/status');
  $('#cam').innerHTML='camera <b>'+s.stream_fps+'</b> fps';$('#delay').innerHTML='delay <b>'+s.lag+'</b> s';
- $('#rec').hidden=!s.recording;setArm(s.person_alerts);$('#tp').textContent=s.today.people;$('#tv').textContent=s.today.vehicles;$('#tu').textContent=s.today.unknown;
+ $('#rec').hidden=!s.recording;setArm(s.person_alerts);showHealth(s.health||{});$('#tp').textContent=s.today.people;$('#tv').textContent=s.today.vehicles;$('#tu').textContent=s.today.unknown;
  const cards=[...s.people.map(p=>`<div class="card"${(p.alerts||[]).length||(p.restricted||[]).length?' style="border-color:var(--bad)"':''}><div class="t"><span style="color:var(--person)">Person ${p.number}${(p.alerts||[]).map(a=>'<span class="alarm">'+esc(a)+'</span>').join('')}${(p.restricted||[]).map(z=>'<span class="alarm">in '+esc(z)+'</span>').join('')}</span><span>${pct(p.score)}</span></div>
   <div class="bar"><i style="width:${pct(p.score)}"></i></div>
   <div class="doing">${esc(p.doing||'')}${(p.zones||[]).length?' · <span class="muted">in '+(p.zones||[]).map(esc).join(', ')+'</span>':''}${p.seconds?' <span class="muted small">· '+p.seconds+'s in view</span>':''}</div></div>`),
@@ -352,30 +369,99 @@ $('#testbtn').onclick=async()=>{const b=$('#testbtn');b.disabled=true;$('#testre
  try{const r=await j('/api/test-alert',{method:'POST'});$('#testres').innerHTML=r.ok?'<span class="st-known">Sent ✓ – check your phone</span>':
  '<span class="st-unknown">Failed – see Recent alerts below</span>';}catch(e){$('#testres').textContent='Failed'}b.disabled=false;alerts();};
 
-let zoneList=[],draft=[];
-function zdraw(){const svg=$('#zsvg');const poly=(pts,c,fill)=>`<polygon points="${pts.map(p=>p.join(',')).join(' ')}" fill="${fill}" stroke="${c}" stroke-width="0.004"/>`;
- svg.innerHTML=zoneList.map(z=>poly(z.points,z.type==='restricted'?'#ff5252':'#f5c542',z.type==='restricted'?'rgba(255,82,82,.18)':'rgba(245,197,66,.15)')).join('')
-  +(draft.length?poly(draft,'#5aa9ff','rgba(90,169,255,.2)')+draft.map(p=>`<circle cx="${p[0]}" cy="${p[1]}" r="0.008" fill="#5aa9ff"/>`).join(''):'');
- $('#zlist').innerHTML=zoneList.map((z,i)=>`<div><span><b>${esc(z.name)}</b> <span class="small muted">${z.type} · ${esc(z.hours)}</span></span>
-  <button class="btn2" onclick="zdel(${i})">Delete</button></div>`).join('')||'<span class="small muted">No zones yet</span>';}
-async function zones(first){if(first!==false){$('#zimg').src='/frame.jpg?'+Date.now()}zoneList=await j('/api/zones');zdraw();}
-async function zput(list,msg){try{zoneList=await j('/api/zones',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(list)});
- $('#zmsg').innerHTML='<span class="st-known">'+msg+'</span>';}catch(e){$('#zmsg').innerHTML='<span class="st-unknown">Could not save</span>'}zdraw();}
-function zdel(i){if(confirm('Delete zone "'+zoneList[i].name+'"?')){const l=zoneList.slice();l.splice(i,1);zput(l,'Deleted')}}
-$('#zpic').addEventListener('click',e=>{const r=$('#zimg').getBoundingClientRect();draft.push([+((e.clientX-r.left)/r.width).toFixed(4),+((e.clientY-r.top)/r.height).toFixed(4)]);zdraw();});
-$('#zundo').onclick=()=>{draft.pop();zdraw()};$('#zclear').onclick=()=>{draft=[];zdraw()};$('#zrefresh').onclick=()=>zones();
-$('#zsave').onclick=()=>{const name=$('#zname').value.trim();if(draft.length<3){$('#zmsg').textContent='Click at least 3 corners on the picture first';return}
- if(!name){$('#zmsg').textContent='Give the zone a name';return}
- zput([...zoneList,{name,type:$('#ztype').value,hours:$('#zhours').value||'always',points:draft}],'Saved "'+name+'" – active straight away');draft=[];$('#zname').value='';};
+// ---- zone editor (canvas) ----
+const ZC=$('#zc'),ZX=ZC.getContext('2d'),zimg=new Image();
+let zoneList=[],zmode='rect',edit=null,drag=null,hover=null,zdirty=true;
+// edit = {i: index or -1, points:[[x,y]...], drawing: bool}; coordinates are normalised 0-1
+const zcol=t=>t==='restricted'?[255,82,82]:[245,197,66];
+function zsize(){const w=ZC.clientWidth||960,h=Math.round(w*((zimg.naturalHeight||9)/(zimg.naturalWidth||16))),d=window.devicePixelRatio||1;
+ if(ZC.width!==Math.round(w*d)||ZC.height!==Math.round(h*d)){ZC.width=Math.round(w*d);ZC.height=Math.round(h*d);ZC.style.height=h+'px';}zdirty=true;}
+function zpt(e){const r=ZC.getBoundingClientRect();return[Math.min(1,Math.max(0,(e.clientX-r.left)/r.width)),Math.min(1,Math.max(0,(e.clientY-r.top)/r.height))];}
+function zpx(p){return[p[0]*ZC.width,p[1]*ZC.height];}
+function inPoly(p,poly){let ins=false;for(let i=0,j=poly.length-1;i<poly.length;j=i++){const[xi,yi]=poly[i],[xj,yj]=poly[j];
+ if((yi>p[1])!==(yj>p[1])&&p[0]<(xj-xi)*(p[1]-yi)/(yj-yi+1e-12)+xi)ins=!ins;}return ins;}
+function nearVertex(p,pts){const d=window.devicePixelRatio||1,lim=12*d;let best=-1,bd=1e9;
+ pts.forEach((q,i)=>{const a=zpx(p),b=zpx(q),dd=Math.hypot(a[0]-b[0],a[1]-b[1]);if(dd<lim&&dd<bd){bd=dd;best=i}});return best;}
+function zrender(){requestAnimationFrame(zrender);if(!zdirty||current!=='zones')return;zdirty=false;
+ const d=window.devicePixelRatio||1;ZX.clearRect(0,0,ZC.width,ZC.height);
+ if(zimg.complete&&zimg.naturalWidth)ZX.drawImage(zimg,0,0,ZC.width,ZC.height);
+ const shape=(pts,rgb,fillA,lw,closed=true)=>{if(!pts.length)return;ZX.beginPath();pts.forEach((p,i)=>{const[x,y]=zpx(p);i?ZX.lineTo(x,y):ZX.moveTo(x,y)});
+  if(closed)ZX.closePath();ZX.fillStyle=`rgba(${rgb},${fillA})`;if(closed)ZX.fill();ZX.lineWidth=lw*d;ZX.strokeStyle=`rgb(${rgb})`;ZX.stroke();};
+ ZX.font=`600 ${13*d}px system-ui,sans-serif`;
+ zoneList.forEach((z,i)=>{if(edit&&edit.i===i)return;const c=zcol(z.type).join(',');shape(z.points,c,.18,2);
+  const[x,y]=zpx(z.points[0]);ZX.fillStyle=`rgb(${c})`;ZX.fillText(z.name,x+6*d,y+16*d);});
+ if(edit){const pts=edit.points.slice();if(edit.drawing&&hover)pts.push(hover);
+  shape(pts,'90,169,255',.22,2.5,!edit.drawing||pts.length>2);
+  edit.points.forEach((p,i)=>{const[x,y]=zpx(p);ZX.beginPath();ZX.arc(x,y,(i===0&&edit.drawing?7:5)*d,0,7);ZX.fillStyle='#fff';ZX.fill();
+   ZX.lineWidth=2*d;ZX.strokeStyle='#5aa9ff';ZX.stroke();});}}
+function zhint(){$('#zhint').textContent=edit&&edit.drawing?'Click to add corners · click the first corner or press Enter to finish':
+ zmode==='rect'?'Drag on the picture to draw a rectangle':'Click to place corners';}
+function zpanel(){const on=!!edit&&!edit.drawing;$('#zpanel').hidden=!on;$('#zpanel').style.display=on?'flex':'none';$('#zempty').hidden=on;
+ if(on){const z=edit.i>=0?zoneList[edit.i]:null;$('#ztitle').textContent=z?'Edit zone':'New zone';$('#zdelete').hidden=!z;}
+ $('#zlist').innerHTML=zoneList.map((z,i)=>`<div class="zi${edit&&edit.i===i?' sel':''}" data-i="${i}"><span><span class="zdot" style="background:rgb(${zcol(z.type)})"></span><b>${esc(z.name)}</b></span>
+  <span class="small muted">${z.type} · ${esc(z.hours)}</span></div>`).join('')||'<span class="small muted">No zones yet</span>';zhint();zdirty=true;}
+function zselect(i){const z=zoneList[i];edit={i,points:z.points.map(p=>p.slice()),drawing:false};
+ $('#zname').value=z.name;$('#ztype').value=z.type;$('#zhours').value=z.hours;zpanel();}
+function znewDone(){if(!edit)return;if(edit.points.length<3){edit=null;zpanel();return}
+ edit.drawing=false;hover=null;$('#zname').value='';$('#ztype').value='restricted';$('#zhours').value='always';zpanel();$('#zname').focus();}
+function zcancel(){edit=null;drag=null;hover=null;zpanel();}
+async function zput(list,msg){const r=await fetch('/api/zones',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(list)});
+ if(!r.ok){$('#zmsg').innerHTML='<span class="st-unknown">'+esc((await r.text()).replace('bad zones: ',''))+'</span>';return}
+ zoneList=await r.json();$('#zmsg').innerHTML='<span class="st-known">'+esc(msg)+'</span>';edit=null;zpanel();}
+async function zones(){zsize();zimg.src='/frame.jpg?'+Date.now();try{zoneList=await j('/api/zones')}catch(e){}zpanel();}
+zimg.onload=()=>{zsize()};window.addEventListener('resize',()=>{if(current==='zones')zsize()});
 
+ZC.addEventListener('pointerdown',e=>{e.preventDefault();ZC.setPointerCapture(e.pointerId);const p=zpt(e);
+ if(edit&&edit.drawing){const v=nearVertex(p,edit.points);if(v===0&&edit.points.length>=3){znewDone();return}edit.points.push(p);zdirty=true;return}
+ if(edit){const v=nearVertex(p,edit.points);if(v>=0){drag={kind:'vertex',v};return}
+  if(inPoly(p,edit.points)){drag={kind:'move',start:p,orig:edit.points.map(q=>q.slice())};return}}
+ const hit=zoneList.map((z,i)=>i).reverse().find(i=>inPoly(p,zoneList[i].points));
+ if(hit!==undefined){zselect(hit);drag={kind:'move',start:p,orig:edit.points.map(q=>q.slice())};return}
+ if(zmode==='rect'){edit={i:-1,points:[p,p.slice(),p.slice(),p.slice()],drawing:false};drag={kind:'rect',start:p};$('#zpanel').hidden=true;zdirty=true;}
+ else{edit={i:-1,points:[p],drawing:true};zpanel();}});
+ZC.addEventListener('pointermove',e=>{const p=zpt(e);
+ if(drag&&edit){if(drag.kind==='vertex')edit.points[drag.v]=p;
+  else if(drag.kind==='move'){let dx=p[0]-drag.start[0],dy=p[1]-drag.start[1];
+   const xs=drag.orig.map(q=>q[0]),ys=drag.orig.map(q=>q[1]);dx=Math.min(1-Math.max(...xs),Math.max(-Math.min(...xs),dx));dy=Math.min(1-Math.max(...ys),Math.max(-Math.min(...ys),dy));
+   edit.points=drag.orig.map(q=>[q[0]+dx,q[1]+dy]);}
+  else if(drag.kind==='rect'){const s0=drag.start;edit.points=[s0,[p[0],s0[1]],p,[s0[0],p[1]]];}zdirty=true;}
+ else if(edit&&edit.drawing){hover=p;zdirty=true;}
+ ZC.style.cursor=edit&&!edit.drawing&&(nearVertex(p,edit.points)>=0)?'grab':edit&&!edit.drawing&&inPoly(p,edit.points)?'move':'crosshair';});
+ZC.addEventListener('pointerup',e=>{if(!drag)return;const k=drag.kind;drag=null;
+ if(k==='rect'){const[a,,c]=edit.points;if(Math.abs(c[0]-a[0])<0.01||Math.abs(c[1]-a[1])<0.01){edit=null;zpanel();return}znewDone();}
+ else zdirty=true;});
+ZC.addEventListener('dblclick',e=>{if(edit&&edit.drawing){edit.points.pop();znewDone();}});
+document.addEventListener('keydown',e=>{if(current!=='zones'||['INPUT','SELECT'].includes(document.activeElement.tagName)&&e.key!=='Enter'&&e.key!=='Escape')return;
+ if(e.key==='Escape'){zcancel();}
+ else if(e.key==='Enter'){if(edit&&edit.drawing)znewDone();else if(edit)$('#zsave').click();}
+ else if(e.key==='Backspace'&&edit&&edit.drawing){e.preventDefault();edit.points.pop();if(!edit.points.length)zcancel();zdirty=true;}
+ else if((e.key==='Delete'||e.key==='Backspace')&&edit&&edit.i>=0){e.preventDefault();$('#zdelete').click();}});
+document.querySelectorAll('.ztools button[data-mode]').forEach(b=>b.onclick=()=>{document.querySelectorAll('.ztools button[data-mode]').forEach(x=>x.classList.remove('on'));
+ b.classList.add('on');zmode=b.dataset.mode;if(edit&&edit.drawing)zcancel();zhint();});
+$('#zrefresh').onclick=()=>{zimg.src='/frame.jpg?'+Date.now()};
+$('#zlist').addEventListener('click',e=>{const it=e.target.closest('.zi');if(it)zselect(+it.dataset.i)});
+$('#zcancel').onclick=zcancel;
+$('#zsave').onclick=()=>{if(!edit)return;const name=$('#zname').value.trim();if(!name){$('#zmsg').textContent='Enter a name';$('#zname').focus();return}
+ const z={name,type:$('#ztype').value,hours:$('#zhours').value.trim()||'always',points:edit.points.map(p=>[+p[0].toFixed(4),+p[1].toFixed(4)])};
+ const l=zoneList.slice();if(edit.i>=0)l[edit.i]=z;else l.push(z);zput(l,`Saved "${name}" – active immediately`);};
+$('#zdelete').onclick=()=>{if(!edit||edit.i<0)return;const z=zoneList[edit.i];if(!confirm(`Delete zone "${z.name}"?`))return;
+ const l=zoneList.slice();l.splice(edit.i,1);zput(l,`Deleted "${z.name}"`);};
+
+
+function showHealth(h){const el=$('#health');if(h.camera_online===undefined){el.textContent='● starting';return}
+ const issues=[];if(!h.camera_online)issues.push('camera offline'+(h.camera_offline_for?' '+Math.round(h.camera_offline_for/60)+' min':''));
+ if(h.lagging)issues.push('falling behind');if(h.low_disk)issues.push('low disk');
+ el.innerHTML=issues.length?'<b style="color:var(--bad)">● '+issues.join(' · ')+'</b>':'<span style="color:var(--ok)">●</span> System OK';
+ el.title='Disk: '+(h.disk_free_gb??'?')+' GB free of '+(h.disk_total_gb??'?')+' GB · up '+Math.round((h.uptime||0)/3600)+' h';}
 let armed=null;
 function setArm(on){armed=on;const b=$('#arm');b.classList.toggle('on',on);
  b.textContent=on?'🔔 Person alerts ON':'🔕 Person alerts OFF';}
 $('#arm').onclick=async()=>{const want=!armed;if(!want&&!confirm('Turn person alerts OFF? People will still be logged and recorded, but your phone will not be pinged.'))return;
  try{const r=await j('/api/switch',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:'person_alerts',on:want})});setArm(r.person_alerts);}catch(e){alert('Could not change alerts')}};
 
-const loaders={activity,vehicles,recordings,zones:()=>zones(false),alerts};let current='activity';
+const loaders={activity,vehicles,recordings,zones:()=>{},alerts};let current='activity';
 document.querySelectorAll('.tabs button').forEach(b=>b.onclick=()=>{document.querySelectorAll('.tabs button,.tab').forEach(x=>x.classList.remove('on'));
- b.classList.add('on');current=b.dataset.tab;$('#'+current).classList.add('on');current==='zones'?zones():loaders[current]();});
-status();activity();setInterval(status,1000);setInterval(()=>loaders[current](),4000);
+ b.classList.add('on');current=b.dataset.tab;$('#'+current).classList.add('on');
+ const live=$('#live img');if(current==='zones'){live.removeAttribute('src');zones();}else{if(!live.getAttribute('src'))live.src='/stream.mjpg';loaders[current]();}});
+status();activity();zrender();setInterval(status,1000);setInterval(()=>loaders[current](),4000);
 </script></body></html>"""

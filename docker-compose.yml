@@ -79,6 +79,8 @@ services:
       RECORD_POST_ROLL: "10"           # seconds recorded after the scene clears
       RECORD_KEEP_RAW: "1"             # also keep the original stream (stream copy)
       RECORD_KEEP_DAYS: "30"           # retention (days)
+      OFFLINE_ALERT_AFTER: "60"        # seconds without video before a camera-offline notification
+      DISK_MIN_FREE_GB: "10"           # below this, notify and remove the oldest recordings
     volumes:
       - ./settings:/settings          # whitelist.yaml, zones.yaml
       - ./data:/data

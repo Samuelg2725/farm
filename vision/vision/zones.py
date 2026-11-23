@@ -8,6 +8,7 @@ from pathlib import Path
 import yaml
 
 from .behaviour import Zone
+from .logic import parse_hours
 
 log = logging.getLogger("vision")
 
@@ -45,8 +46,12 @@ class ZoneStore:
             if len(pts) < 3 or not str(z.get("name", "")).strip():
                 continue
             kind = z.get("type", "restricted") if z.get("type") in ("restricted", "watch") else "restricted"
-            clean.append({"name": str(z["name"]).strip()[:40], "type": kind,
-                          "hours": str(z.get("hours") or "always").strip(), "points": pts})
+            hours = str(z.get("hours") or "always").strip().lower()
+            try:
+                parse_hours(hours)
+            except ValueError:
+                raise ValueError(f"invalid hours for zone '{z['name']}': use 'always' or e.g. 18:00-07:00")
+            clean.append({"name": str(z["name"]).strip()[:40], "type": kind, "hours": hours, "points": pts})
         header = ("# Zones defined in the dashboard. Points are normalised image coordinates (0-1).\n"
                   "# type: restricted (notify on entry) or watch (log only)\n"
                   "# hours: always, or a time range such as 18:00-07:00\n")

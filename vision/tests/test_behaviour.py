@@ -121,3 +121,15 @@ def test_camera_pan_is_not_walking():
     other = cv2.GaussianBlur((np.random.default_rng(7).random((720, 1280)) * 255).astype(np.uint8), (0, 0), 3)
     _, jumped = cm.update(cv2.cvtColor(other, cv2.COLOR_GRAY2BGR))  # picture changes completely (preset move)
     assert jumped
+
+
+def test_zone_store_validates_and_saves(tmp_path):
+    import pytest
+    from vision.zones import ZoneStore
+    zs = ZoneStore(str(tmp_path / "zones.yaml"))
+    sq = [[0.1, 0.1], [0.5, 0.1], [0.5, 0.5]]
+    out = zs.save([{"name": " Gate ", "type": "watch", "hours": "18:00-07:00", "points": sq},
+                   {"name": "", "points": sq}, {"name": "Tiny", "points": sq[:2]}])
+    assert [z["name"] for z in out] == ["Gate"] and zs.get()[0].hours == "18:00-07:00"
+    with pytest.raises(ValueError):
+        zs.save([{"name": "Bad", "hours": "teatime", "points": sq}])

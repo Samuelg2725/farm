@@ -15,6 +15,8 @@ and run locally in Docker.
 - **Recording** of annotated and original video while activity is present, with configurable retention.
 - **Notifications** via ntfy, with annotated images, plate close-ups and video clips.
 - **Web dashboard** with live view, activity log, vehicle register, recordings, zone editor and alert settings.
+- **Health monitoring** with notifications for camera loss and recovery, processing delays, low disk space
+  (oldest recordings are removed automatically) and system start-up.
 
 ## Architecture
 
@@ -35,7 +37,7 @@ cp .env.example .env            # set camera address and credentials
 docker compose up -d --build
 ```
 
-- Dashboard: `http://<host>:8090`
+- Dashboard: `http://<host>:8090` – available to any device on the local network; no internet connection is required
 - Frigate: `https://<host>:8971` (initial password: `docker logs frigate`)
 - Authorised vehicles: `settings/whitelist.yaml`
 - Service settings: `docker-compose.yml` (`vision` environment)

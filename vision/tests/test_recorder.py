@@ -52,3 +52,12 @@ def test_cleanup_old_days(tmp_path):
     (out / "2026-11-20").mkdir(parents=True)
     Recorder("x", str(out), keep_days=30).cleanup(datetime(2026, 11, 23))
     assert not (out / "2026-01-01").exists() and (out / "2026-11-20").exists()
+
+
+def test_free_space_deletes_oldest_first(tmp_path):
+    from vision.recorder import free_space
+    for d in ("2026-11-20", "2026-11-21", "2026-11-22"):
+        (tmp_path / d).mkdir()
+    removed = free_space(tmp_path, min_free_gb=1e9, keep_newest=1)        # impossible target: delete all but newest
+    assert removed == ["2026-11-20", "2026-11-21"] and (tmp_path / "2026-11-22").exists()
+    assert free_space(tmp_path, min_free_gb=0) == []
