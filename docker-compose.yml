@@ -67,9 +67,13 @@ services:
       FPS: "5"                         # detections per second
       WHITELIST_PATH: /settings/whitelist.yaml
       DB_PATH: /data/vision.db
+      RECORD: "1"                      # save 4K video while a person/vehicle is in view
+      RECORD_POST_ROLL: "10"           # keep recording this many seconds after they leave
+      RECORD_KEEP_DAYS: "30"           # delete recordings older than this
     volumes:
       - ./settings:/settings:ro
       - ./data:/data
+      - ./recordings:/recordings       # clips: recordings/YYYY-MM-DD/HH-MM-SS_person+vehicle.mp4
     ports:
       - "8090:8090"
     depends_on: [frigate, ntfy]

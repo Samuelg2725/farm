@@ -16,6 +16,7 @@ import sqlite3
 import threading
 import time
 from datetime import datetime
+from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import cv2
@@ -26,6 +27,7 @@ from norfair import Detection, Tracker
 from .detector import PERSON, VEHICLES, Detector
 from .logic import AlertPolicy, DailyNumbers, LagMeter
 from .plates import PlateBook, PlateReader, Whitelist, crop_scaled
+from .recorder import Recorder
 
 log = logging.getLogger("vision")
 
@@ -47,6 +49,10 @@ NTFY_URL = os.getenv("NTFY_URL", "").rstrip("/")
 WHITELIST_PATH = os.getenv("WHITELIST_PATH", "/settings/whitelist.yaml")
 DB_PATH = os.getenv("DB_PATH", "/data/vision.db")
 PORT = int(os.getenv("PORT", "8090"))
+RECORD = os.getenv("RECORD", "1") == "1"
+RECORDINGS_DIR = os.getenv("RECORDINGS_DIR", "/recordings")
+RECORD_POST_ROLL = float(os.getenv("RECORD_POST_ROLL", "10"))   # keep recording this long after they leave
+RECORD_KEEP_DAYS = int(os.getenv("RECORD_KEEP_DAYS", "30"))
 
 PERSON_COLOURS = [(0, 200, 255), (255, 120, 0), (200, 0, 255), (255, 255, 0), (255, 0, 160), (120, 255, 120)]
 VEHICLE_COLOURS = {"known": (0, 200, 0), "unknown": (0, 0, 255), "checking": (0, 215, 255), "no-plate": (180, 180, 180)}
@@ -60,6 +66,7 @@ class FrameGrabber(threading.Thread):
         super().__init__(daemon=True)
         self.url, self.frame, self.lock = url, None, threading.Lock()
         self.frames, self.fps, self.seq, self.lag, self.skips = 0, 0.0, 0, 0.0, 0
+        self.codec = ""
 
     def run(self):
         while True:
@@ -68,7 +75,9 @@ class FrameGrabber(threading.Thread):
                 log.warning("Cannot open %s – retrying in 5 s", self.url)
                 time.sleep(5)
                 continue
-            log.info("Connected to stream %s (%dx%d)", self.url,
+            fourcc = int(cap.get(cv2.CAP_PROP_FOURCC))
+            self.codec = "".join(chr((fourcc >> 8 * i) & 0xFF) for i in range(4)).strip("\x00 ").lower()
+            log.info("Connected to stream %s (%s %dx%d)", self.url, self.codec,
                      int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)))
             t_count, n, meter = time.time(), 0, LagMeter()
             while True:
@@ -179,18 +188,46 @@ def render_loop(grabber: "FrameGrabber") -> None:
 
 
 STATE = State()
+RECORDER: Recorder | None = None
+
+
+def recordings_page() -> str:
+    import html
+    clips = RECORDER.list_clips() if RECORDER else []
+    rows, day = [], None
+    for c in clips:
+        if c["day"] != day:
+            day = c["day"]
+            rows.append(f"<h3>{html.escape(day)}</h3>")
+        name = html.escape(c["name"].replace("_", " · ").replace("-", ":", 2))
+        thumb = f'<img src="/rec/{c["thumb"]}" loading="lazy">' if c["thumb"] else ""
+        live = ' <b style="color:#f44">● recording now</b>' if c["live"] else ""
+        rows.append(f'<a class="clip" href="/rec/{c["file"]}" target="_blank">{thumb}<div>{name}{live}<br>'
+                    f'<small>{c["size_mb"]} MB</small></div></a>')
+    body = "".join(rows) or "<p>No recordings yet – they appear here when a person or vehicle is seen.</p>"
+    return f"""<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1"><title>Farm Recordings</title>
+<style>body{{margin:0;padding:10px 16px;background:#111;color:#eee;font-family:system-ui,sans-serif}}
+a{{color:#8cf}}.clip{{display:inline-block;width:300px;margin:6px;vertical-align:top;color:#eee;text-decoration:none}}
+.clip img{{width:300px;border-radius:4px;display:block}}</style></head><body>
+<p><a href="/">← Live view</a></p><h2>Recordings</h2>
+<p><small>Full-quality camera video, saved whenever a person or vehicle is in view. Click to play.
+Kept {RECORD_KEEP_DAYS} days.</small></p>{body}</body></html>"""
 
 PAGE = """<!doctype html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>Farm Live View</title>
 <style>body{margin:0;background:#111;color:#eee;font-family:system-ui,sans-serif}
 header{padding:10px 16px;font-size:18px}img{width:100%;max-width:1920px;display:block;margin:auto}
 .row{padding:6px 16px;font-size:15px}.unknown{color:#ff5a5a;font-weight:bold}.known{color:#5ad15a}</style></head><body>
-<header>Farm live view – <span id="count">…</span> <small id="health" style="color:#999"></small></header>
+<header>Farm live view – <span id="count">…</span> <small id="health" style="color:#999"></small>
+<span id="rec" style="color:#ff4040;font-weight:bold"></span>
+<a href="/recordings" style="float:right;color:#8cf">Recordings</a></header>
 <img src="/stream.mjpg" alt="live view"><div class="row" id="people"></div><div class="row" id="vehicles"></div>
 <script>
 async function tick(){try{const s=await (await fetch('/status.json')).json();
 document.getElementById('count').textContent=s.people.length+' people, '+s.vehicles.length+' vehicles';
 document.getElementById('health').textContent='· camera '+s.stream_fps+' fps · delay '+s.lag+' s';
+document.getElementById('rec').textContent=s.recording?' ● REC':'';
 document.getElementById('people').textContent='People: '+(s.people.map(p=>'Person '+p.number).join(' - ')||'none');
 document.getElementById('vehicles').innerHTML='Vehicles: '+(s.vehicles.map(v=>'<span class="'+v.status+'">Vehicle '+v.number+
  (v.plate?' '+v.plate:'')+' ('+v.status+(v.owner?' – '+v.owner:'')+')</span>').join(' - ')||'none');}catch(e){}}
@@ -208,7 +245,8 @@ class Handler(BaseHTTPRequestHandler):
         elif self.path == "/status.json":
             with STATE.lock:
                 body = json.dumps({"camera": CAMERA, "people": STATE.people, "vehicles": STATE.vehicles,
-                                   "stream_fps": round(STATE.stream_fps, 1), "lag": round(STATE.lag, 1)})
+                                   "stream_fps": round(STATE.stream_fps, 1), "lag": round(STATE.lag, 1),
+                                   "recording": RECORDER is not None and RECORDER.recording})
             self._send(200, "application/json", body.encode())
         elif self.path == "/snapshot.jpg":
             with STATE.lock:
@@ -231,8 +269,48 @@ class Handler(BaseHTTPRequestHandler):
                     time.sleep(0.05)
             except (BrokenPipeError, ConnectionResetError):
                 pass
+        elif self.path == "/recordings":
+            self._send(200, "text/html; charset=utf-8", recordings_page().encode())
+        elif self.path.startswith("/rec/") and RECORDER is not None:
+            self._send_file(self.path[len("/rec/"):])
         else:
             self._send(404, "text/plain", b"not found")
+
+    def _send_file(self, rel: str):
+        """Serves a recording, with Range support so browsers can play/seek video."""
+        from urllib.parse import unquote
+        base = Path(RECORDINGS_DIR).resolve()
+        f = (base / unquote(rel)).resolve()
+        if base not in f.parents or not f.is_file() or f.suffix not in (".mp4", ".jpg"):
+            return self._send(404, "text/plain", b"not found")
+        size = f.stat().st_size
+        ctype = "video/mp4" if f.suffix == ".mp4" else "image/jpeg"
+        start, end = 0, size - 1
+        rng = self.headers.get("Range", "")
+        if rng.startswith("bytes="):
+            a, _, b = rng[6:].partition("-")
+            start = int(a) if a else max(0, size - int(b))
+            end = min(int(b), size - 1) if (a and b) else end
+            self.send_response(206)
+            self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
+        else:
+            self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Accept-Ranges", "bytes")
+        self.send_header("Content-Length", str(end - start + 1))
+        self.end_headers()
+        try:
+            with open(f, "rb") as fh:
+                fh.seek(start)
+                left = end - start + 1
+                while left > 0:
+                    chunk = fh.read(min(1 << 20, left))
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+                    left -= len(chunk)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
 
     def _send(self, code, ctype, body):
         self.send_response(code)
@@ -295,6 +373,9 @@ def main() -> None:
     jobs: queue.Queue = queue.Queue(maxsize=8)
     if OWN_ALPR:
         threading.Thread(target=plate_worker, args=(jobs, book, book_lock), daemon=True).start()
+    global RECORDER
+    if RECORD:
+        RECORDER = Recorder(STREAM_URL, RECORDINGS_DIR, post_roll=RECORD_POST_ROLL, keep_days=RECORD_KEEP_DAYS)
     grabber = FrameGrabber(STREAM_URL)
     grabber.start()
     threading.Thread(target=render_loop, args=(grabber,), daemon=True).start()
@@ -350,6 +431,15 @@ def main() -> None:
         with STATE.lock:
             STATE.people, STATE.vehicles = people, vehicles
         jpeg = b""
+        if RECORDER is not None:
+            labels = ({"person"} if people else set()) | ({"vehicle"} if vehicles else set())
+            snap = b""
+            if labels and not RECORDER.recording:
+                RECORDER.codec = grabber.codec or "h264"
+                ok_s, b_s = cv2.imencode(".jpg", draw(frame, people, vehicles, 640), [cv2.IMWRITE_JPEG_QUALITY, 80])
+                snap = b_s.tobytes() if ok_s else b""
+            RECORDER.update(now, labels, snap)
+
         if new_people or decided:  # picture for alerts
             ok, buf = cv2.imencode(".jpg", draw(frame, people, vehicles), [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
             jpeg = buf.tobytes() if ok else b""

@@ -1,6 +1,8 @@
 # syntax=docker/dockerfile:1.7
 FROM python:3.12-slim
 WORKDIR /app
+# ffmpeg: saves recordings by copying the camera video (no re-encoding)
+RUN apt-get update && apt-get install -y --no-install-recommends ffmpeg && rm -rf /var/lib/apt/lists/*
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 # YOLOX-S people + vehicle detector (Apache-2.0), from the official YOLOX release

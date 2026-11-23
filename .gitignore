@@ -5,3 +5,4 @@ frigate/config/model_cache/
 __pycache__/
 data/*
 !data/.gitkeep
+recordings/

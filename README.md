@@ -119,6 +119,16 @@ Open **http://localhost:8090** (or `http://HOST_IP:8090` from a phone/laptop on 
 - Top bar: time, number of people and vehicles in view. Lists underneath the picture.
 - Everything is logged to `data/vision.db` (tables `people` and `vehicles`).
 
+### Recordings
+
+Whenever a person or vehicle is in view, the original **4K video** is saved (copied straight from the camera – full quality, almost no CPU). Recording stops 10 s after they leave.
+
+- Watch them at **http://localhost:8090/recordings** (or the *Recordings* link on the live view) – click a clip to play.
+- Files are in the `recordings/` folder: `recordings/2026-11-23/12-25-43_person+vehicle.mp4`, with a snapshot `.jpg` (boxes drawn on) next to each.
+- A red **● REC** shows in the live view header while recording.
+- Kept 30 days (`RECORD_KEEP_DAYS`). Roughly 2–4 GB per hour of activity at 4K – keep an eye on disk space.
+- Frigate also keeps its own recordings (https://localhost:8971 → Review).
+
 Watch what it's doing:
 
 ```bash
