@@ -19,13 +19,16 @@ class LiveState:
         self.stream_fps = 0.0
         self.lag = 0.0
         self.recording = ""
+        self.zones: list[dict] = []
+        self.raw_jpeg: bytes = b""   # picture without boxes, for drawing zones
 
 
 class App:
     """Everything the web page needs to read."""
 
-    def __init__(self, state: LiveState, db, notifier, recordings_dir: str, camera: str, keep_days: int):
-        self.state, self.db, self.notifier = state, db, notifier
+    def __init__(self, state: LiveState, db, notifier, recordings_dir: str, camera: str, keep_days: int,
+                 zone_store=None):
+        self.state, self.db, self.notifier, self.zone_store = state, db, notifier, zone_store
         self.recordings_dir, self.camera, self.keep_days = Path(recordings_dir), camera, keep_days
 
 
@@ -52,6 +55,12 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, "text/html; charset=utf-8", DASHBOARD.encode())
         if url.path == "/stream.mjpg":
             return self._stream()
+        if url.path == "/frame.jpg":
+            with a.state.lock:
+                jpeg = a.state.raw_jpeg or a.state.jpeg
+            return self._send(200 if jpeg else 503, "image/jpeg", jpeg)
+        if url.path == "/api/zones":
+            return self._json(a.zone_store.as_dicts() if a.zone_store else [])
         if url.path == "/snapshot.jpg":
             with a.state.lock:
                 jpeg = a.state.jpeg
@@ -91,6 +100,13 @@ class Handler(BaseHTTPRequestHandler):
         return self._send(404, "text/plain", b"not found")
 
     def do_POST(self):
+        if urlparse(self.path).path == "/api/zones" and self.app.zone_store is not None:
+            try:
+                n = int(self.headers.get("Content-Length", "0"))
+                zones = json.loads(self.rfile.read(min(n, 200_000)) or b"[]")
+                return self._json(self.app.zone_store.save(zones))
+            except Exception as e:
+                return self._send(400, "text/plain", f"bad zones: {e}".encode())
         if urlparse(self.path).path == "/api/test-alert":
             ok = self.app.notifier.send("Test alert", f"Farm cameras are connected to this phone – "
                                         f"{datetime.now():%d %b %H:%M:%S}", tags="white_check_mark",
@@ -207,6 +223,13 @@ dialog{background:var(--panel);color:var(--text);border:1px solid var(--line);bo
 dialog video{width:100%;display:block;background:#000;max-height:70vh}dialog .body{padding:12px 14px}
 dialog::backdrop{background:rgba(0,0,0,.7)}.x{float:right;background:none;border:0;color:var(--text);font-size:22px;cursor:pointer}
 .empty{color:var(--muted);padding:14px 0}
+.doing{margin-top:4px;font-size:13px}.alarm{color:#fff;background:var(--bad);border-radius:4px;padding:1px 6px;font-size:12px;font-weight:600;margin-left:4px}
+.beh{color:var(--warn)}.beh.alert{color:var(--bad);font-weight:600}
+.zedit{display:flex;gap:16px;flex-wrap:wrap;align-items:flex-start}.zpic{position:relative;flex:1 1 560px;max-width:960px;cursor:crosshair}
+.zpic img{width:100%;display:block;border-radius:6px;background:#000}.zpic svg{position:absolute;inset:0;width:100%;height:100%}
+.zform{flex:0 1 300px;display:flex;flex-direction:column;gap:8px}.zform input,.zform select{background:#222733;color:var(--text);border:1px solid var(--line);border-radius:6px;padding:8px;font:inherit}
+.btn2{background:#2a303b;color:var(--text);border:0;border-radius:6px;padding:8px 12px;font:inherit;cursor:pointer}
+.zlist div{display:flex;justify-content:space-between;align-items:center;padding:6px 0;border-bottom:1px solid var(--line)}
 </style></head><body>
 <header><h1>🐄🐖🐔 Farm Security</h1>
 <span class="pill" id="cam">camera …</span><span class="pill" id="delay">delay …</span>
@@ -219,16 +242,27 @@ dialog::backdrop{background:rgba(0,0,0,.7)}.x{float:right;background:none;border
  <section class="panel full">
   <div class="tabs">
    <button data-tab="activity" class="on">Activity log</button><button data-tab="vehicles">Vehicles &amp; plates</button>
-   <button data-tab="recordings">Recordings</button><button data-tab="alerts">Phone alerts</button>
+   <button data-tab="recordings">Recordings</button><button data-tab="zones">Zones</button><button data-tab="alerts">Phone alerts</button>
   </div>
   <div class="tab on" id="activity"><div class="tablewrap"><table><thead><tr><th>Time</th><th>What</th><th>Confidence</th>
-   <th>Plate</th><th>Details</th><th>Status</th><th>Clip</th></tr></thead><tbody></tbody></table></div></div>
+   <th>Plate</th><th>Details / doing</th><th>Status</th><th>Clip</th></tr></thead><tbody></tbody></table></div></div>
   <div class="tab" id="vehicles"><div class="tablewrap"><table><thead><tr><th>Time</th><th>Plate</th><th>Status</th><th>Country</th>
    <th>Region registered</th><th>Plate issued</th><th>Type</th><th>Colour (approx)</th><th>Vehicle conf.</th><th>Plate conf.</th><th>Clip</th>
    </tr></thead><tbody></tbody></table></div>
    <p class="small muted">Region and issue date are worked out from the plate itself (UK plates since 2001: first letter = region, numbers = when issued).
    Private plates can move between cars, so the date is for the plate, not necessarily the car.</p></div>
   <div class="tab" id="recordings"><p class="small muted" id="recinfo"></p><div class="grid"></div></div>
+  <div class="tab" id="zones"><div class="zedit">
+   <div class="zpic" id="zpic"><img id="zimg" alt="camera picture"><svg id="zsvg" viewBox="0 0 1 1" preserveAspectRatio="none"></svg></div>
+   <div class="zform"><b>Draw a zone</b><span class="small muted">Click on the picture to add corners (3 or more), then name it and save.
+    Someone is "in" a zone when their feet are inside it.</span>
+    <input id="zname" placeholder="Name, e.g. Lairage, Back fence">
+    <select id="ztype"><option value="restricted">Restricted – alert when someone enters</option><option value="watch">Watch – log only</option></select>
+    <input id="zhours" placeholder="When: always, or e.g. 18:00-07:00" value="always">
+    <div style="display:flex;gap:6px;flex-wrap:wrap"><button class="btn" id="zsave">Save zone</button><button class="btn2" id="zundo">Undo point</button>
+     <button class="btn2" id="zclear">Clear</button><button class="btn2" id="zrefresh">New picture</button></div>
+    <span id="zmsg" class="small"></span><b style="margin-top:10px">Zones</b><div class="zlist" id="zlist"></div></div>
+  </div></div>
   <div class="tab" id="alerts"><div class="steps">
    <div class="qr" id="qr"></div>
    <ol><li>Install the free <b>ntfy</b> app (App Store / Google Play).</li>
@@ -257,8 +291,9 @@ async function j(u,o){const r=await fetch(u,o);return r.json()}
 async function status(){try{const s=await j('/api/status');
  $('#cam').innerHTML='camera <b>'+s.stream_fps+'</b> fps';$('#delay').innerHTML='delay <b>'+s.lag+'</b> s';
  $('#rec').hidden=!s.recording;$('#tp').textContent=s.today.people;$('#tv').textContent=s.today.vehicles;$('#tu').textContent=s.today.unknown;
- const cards=[...s.people.map(p=>`<div class="card"><div class="t"><span style="color:var(--person)">Person ${p.number}</span><span>${pct(p.score)}</span></div>
-  <div class="bar"><i style="width:${pct(p.score)}"></i></div></div>`),
+ const cards=[...s.people.map(p=>`<div class="card"${(p.alerts||[]).length||(p.restricted||[]).length?' style="border-color:var(--bad)"':''}><div class="t"><span style="color:var(--person)">Person ${p.number}${(p.alerts||[]).map(a=>'<span class="alarm">'+esc(a)+'</span>').join('')}${(p.restricted||[]).map(z=>'<span class="alarm">in '+esc(z)+'</span>').join('')}</span><span>${pct(p.score)}</span></div>
+  <div class="bar"><i style="width:${pct(p.score)}"></i></div>
+  <div class="doing">${esc(p.doing||'')}${(p.zones||[]).length?' · <span class="muted">in '+(p.zones||[]).map(esc).join(', ')+'</span>':''}${p.seconds?' <span class="muted small">· '+p.seconds+'s in view</span>':''}</div></div>`),
   ...s.vehicles.map(v=>`<div class="card"><div class="t"><span>Vehicle ${v.number} <span class="muted small">${esc(v.kind)}</span></span><span>${pct(v.score)}</span></div>
   <div style="margin-top:6px">${plate(v.plate)} ${st(v.status,v.owner)}</div>
   <div class="small muted" style="margin-top:4px">${details(v)}${v.plate_conf?' · plate '+pct(v.plate_conf):''}</div></div>`)];
@@ -266,9 +301,9 @@ async function status(){try{const s=await j('/api/status');
 
 async function activity(){const rows=await j('/api/events?limit=150');
  $('#activity tbody').innerHTML=rows.map(e=>`<tr><td>${tm(e.ts)}</td>
-  <td>${e.kind==='person'?'<span style="color:var(--person)">Person '+e.number+'</span>':'Vehicle '+e.number+' <span class="muted">'+esc(e.label)+'</span>'}</td>
-  <td>${pct(e.confidence)}</td><td>${plate(e.plate)}</td><td class="small">${details(e)}</td>
-  <td>${st(e.status,e.owner)}</td><td>${clipLink(e.clip)}</td></tr>`).join('')||'<tr><td colspan=7 class="empty">Nothing seen yet</td></tr>';}
+  <td>${e.kind==='person'?'<span style="color:var(--person)">Person '+e.number+'</span>':e.kind==='behaviour'?'<span style="color:var(--person)">Person '+e.number+'</span> <span class="beh'+(e.status==='alert'?' alert':'')+'">→ '+esc(e.label)+'</span>':'Vehicle '+e.number+' <span class="muted">'+esc(e.label)+'</span>'}</td>
+  <td>${pct(e.confidence)}</td><td>${plate(e.plate)}</td><td class="small">${e.kind==='person'?esc(e.actions||''):e.kind==='behaviour'?esc(e.details||''):details(e)}</td>
+  <td>${e.kind==='vehicle'?st(e.status,e.owner):''}</td><td>${clipLink(e.clip)}</td></tr>`).join('')||'<tr><td colspan=7 class="empty">Nothing seen yet</td></tr>';}
 
 async function vehicles(){const rows=await j('/api/vehicles?limit=200');
  $('#vehicles tbody').innerHTML=rows.map(e=>`<tr><td>${tm(e.ts)}</td><td>${plate(e.plate)}</td><td>${st(e.status,e.owner)}</td>
@@ -294,7 +329,7 @@ async function alerts(){const a=await j('/api/alerts');
 async function play(file){const p=$('#player');p.querySelector('video').src='/rec/'+file;
  $('#ptitle').textContent=file.replace('.mp4','').replace('/',' ');$('#praw').href='/rec/'+file.replace('.mp4','_4k.mp4');
  const ev=await j('/api/clip-events?file='+encodeURIComponent(file));
- $('#pevents').innerHTML=ev.map(e=>`${tm(e.ts)} – ${e.kind==='person'?'Person '+e.number:'Vehicle '+e.number+' '+plate(e.plate)+' '+st(e.status,e.owner)} (${pct(e.confidence)})`).join('<br>');
+ $('#pevents').innerHTML=ev.map(e=>`${tm(e.ts)} – ${e.kind==='person'?'Person '+e.number+(e.actions?' ('+esc(e.actions)+')':''):e.kind==='behaviour'?'Person '+e.number+' → '+esc(e.label):'Vehicle '+e.number+' '+plate(e.plate)+' '+st(e.status,e.owner)} (${pct(e.confidence)})`).join('<br>');
  p.showModal();p.querySelector('video').play().catch(()=>{});}
 $('#player').addEventListener('close',()=>{const v=$('#player video');v.pause();v.removeAttribute('src');v.load()});
 
@@ -302,8 +337,24 @@ $('#testbtn').onclick=async()=>{const b=$('#testbtn');b.disabled=true;$('#testre
  try{const r=await j('/api/test-alert',{method:'POST'});$('#testres').innerHTML=r.ok?'<span class="st-known">Sent ✓ – check your phone</span>':
  '<span class="st-unknown">Failed – see Recent alerts below</span>';}catch(e){$('#testres').textContent='Failed'}b.disabled=false;alerts();};
 
-const loaders={activity,vehicles,recordings,alerts};let current='activity';
+let zoneList=[],draft=[];
+function zdraw(){const svg=$('#zsvg');const poly=(pts,c,fill)=>`<polygon points="${pts.map(p=>p.join(',')).join(' ')}" fill="${fill}" stroke="${c}" stroke-width="0.004"/>`;
+ svg.innerHTML=zoneList.map(z=>poly(z.points,z.type==='restricted'?'#ff5252':'#f5c542',z.type==='restricted'?'rgba(255,82,82,.18)':'rgba(245,197,66,.15)')).join('')
+  +(draft.length?poly(draft,'#5aa9ff','rgba(90,169,255,.2)')+draft.map(p=>`<circle cx="${p[0]}" cy="${p[1]}" r="0.008" fill="#5aa9ff"/>`).join(''):'');
+ $('#zlist').innerHTML=zoneList.map((z,i)=>`<div><span><b>${esc(z.name)}</b> <span class="small muted">${z.type} · ${esc(z.hours)}</span></span>
+  <button class="btn2" onclick="zdel(${i})">Delete</button></div>`).join('')||'<span class="small muted">No zones yet</span>';}
+async function zones(first){if(first!==false){$('#zimg').src='/frame.jpg?'+Date.now()}zoneList=await j('/api/zones');zdraw();}
+async function zput(list,msg){try{zoneList=await j('/api/zones',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(list)});
+ $('#zmsg').innerHTML='<span class="st-known">'+msg+'</span>';}catch(e){$('#zmsg').innerHTML='<span class="st-unknown">Could not save</span>'}zdraw();}
+function zdel(i){if(confirm('Delete zone "'+zoneList[i].name+'"?')){const l=zoneList.slice();l.splice(i,1);zput(l,'Deleted')}}
+$('#zpic').addEventListener('click',e=>{const r=$('#zimg').getBoundingClientRect();draft.push([+((e.clientX-r.left)/r.width).toFixed(4),+((e.clientY-r.top)/r.height).toFixed(4)]);zdraw();});
+$('#zundo').onclick=()=>{draft.pop();zdraw()};$('#zclear').onclick=()=>{draft=[];zdraw()};$('#zrefresh').onclick=()=>zones();
+$('#zsave').onclick=()=>{const name=$('#zname').value.trim();if(draft.length<3){$('#zmsg').textContent='Click at least 3 corners on the picture first';return}
+ if(!name){$('#zmsg').textContent='Give the zone a name';return}
+ zput([...zoneList,{name,type:$('#ztype').value,hours:$('#zhours').value||'always',points:draft}],'Saved "'+name+'" – active straight away');draft=[];$('#zname').value='';};
+
+const loaders={activity,vehicles,recordings,zones:()=>zones(false),alerts};let current='activity';
 document.querySelectorAll('.tabs button').forEach(b=>b.onclick=()=>{document.querySelectorAll('.tabs button,.tab').forEach(x=>x.classList.remove('on'));
- b.classList.add('on');current=b.dataset.tab;$('#'+current).classList.add('on');loaders[current]();});
+ b.classList.add('on');current=b.dataset.tab;$('#'+current).classList.add('on');current==='zones'?zones():loaders[current]();});
 status();activity();setInterval(status,1000);setInterval(()=>loaders[current](),4000);
 </script></body></html>"""

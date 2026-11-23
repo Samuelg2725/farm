@@ -1,0 +1,4 @@
+# Zones drawn on the dashboard (Zones tab). Points are fractions of the picture (0-1).
+# type: restricted = alert when someone enters, watch = log only.
+# hours: always, or a time range like 18:00-07:00
+zones: []

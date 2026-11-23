@@ -10,7 +10,7 @@ CREATE TABLE IF NOT EXISTS events (
     ts TEXT NOT NULL,            -- when first seen
     last_seen TEXT,
     camera TEXT,
-    kind TEXT NOT NULL,          -- person | vehicle
+    kind TEXT NOT NULL,          -- person | vehicle | behaviour
     number INTEGER,              -- Person 3 / Vehicle 2 (per day)
     label TEXT,                  -- person / car / truck / bus / motorcycle
     confidence REAL,             -- best detection confidence 0..1
@@ -18,7 +18,9 @@ CREATE TABLE IF NOT EXISTS events (
     country TEXT, plate_format TEXT, region TEXT, registered TEXT, colour TEXT,
     status TEXT,                 -- vehicles: known | unknown | checking | no-plate
     owner TEXT,
-    clip TEXT                    -- recording file this happened in
+    clip TEXT,                   -- recording file this happened in
+    actions TEXT,                -- people: what they were seen doing (running, crouching…)
+    details TEXT                 -- behaviours: extra info
 );
 CREATE INDEX IF NOT EXISTS events_ts ON events(ts);
 CREATE TABLE IF NOT EXISTS recordings (
@@ -44,6 +46,10 @@ class DB:
         with self.lock:
             self.conn.execute("PRAGMA journal_mode=WAL")
             self.conn.executescript(SCHEMA)
+            have = {r[1] for r in self.conn.execute("PRAGMA table_info(events)")}
+            for col in ("actions", "details"):  # upgrade databases made by older versions
+                if col not in have:
+                    self.conn.execute(f"ALTER TABLE events ADD COLUMN {col} TEXT")
             self.conn.commit()
 
     def insert(self, table: str, **values) -> int:

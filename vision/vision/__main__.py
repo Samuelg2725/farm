@@ -19,13 +19,16 @@ import numpy as np
 from norfair import Detection, Tracker
 
 from .alerts import Notifier
+from .behaviour import LABELS, BehaviourAnalyzer, CameraMotion
 from .db import DB
 from .detector import PERSON, VEHICLES, Detector
 from .logic import AlertPolicy, DailyNumbers, LagMeter
 from .plateinfo import describe, estimate_colour
 from .plates import PlateBook, PlateReader, Whitelist, crop_scaled
+from .pose import SKELETON, PoseEstimator
 from .recorder import Recorder
 from .web import App, LiveState, serve
+from .zones import ZoneStore
 
 log = logging.getLogger("vision")
 
@@ -56,6 +59,13 @@ RECORD_KEEP_RAW = env("RECORD_KEEP_RAW", "1") == "1"
 RECORDINGS_DIR = env("RECORDINGS_DIR", "/recordings")
 RECORD_POST_ROLL = float(env("RECORD_POST_ROLL", "10"))
 RECORD_KEEP_DAYS = int(env("RECORD_KEEP_DAYS", "30"))
+POSE = env("POSE", "1") == "1"
+POSE_MODEL = env("POSE_MODEL", "/models/rtmpose-m.onnx")
+LOW_SCORE = float(env("LOW_SCORE", "0.25"))  # weaker detections accepted only for people already tracked
+LOITER_SECONDS = float(env("LOITER_SECONDS", "120"))
+BEHAVIOUR_ALERTS = {b.strip() for b in env("BEHAVIOUR_ALERTS", "lying down,climbing,restricted zone,loitering").split(",")}
+BEHAVIOUR_ALERT_COOLDOWN = float(env("BEHAVIOUR_ALERT_COOLDOWN", "120"))
+ZONES_PATH = env("ZONES_PATH", "/settings/zones.yaml")
 GONE_AFTER = 5.0  # seconds out of view before a person/vehicle's log entry is finalised
 
 PERSON_COLOURS = [(0, 200, 255), (255, 120, 0), (200, 0, 255), (255, 255, 0), (255, 0, 160), (120, 255, 120)]
@@ -120,13 +130,24 @@ def _label(img, text, x, y, colour, scale):
     cv2.putText(img, text, (x + 3, ty - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.6 * scale, (0, 0, 0), 2)
 
 
-def draw(frame: np.ndarray, people: list[dict], vehicles: list[dict], width: int = DISPLAY_WIDTH) -> np.ndarray:
+def draw(frame: np.ndarray, people: list[dict], vehicles: list[dict], width: int = DISPLAY_WIDTH,
+         zones: list[dict] | None = None) -> np.ndarray:
     """New image `width` wide with every box drawn (boxes are in `frame` pixels)."""
     f = width / frame.shape[1]
     img = cv2.resize(frame, (width, int(round(frame.shape[0] * f))),
                      interpolation=cv2.INTER_AREA if f < 1 else cv2.INTER_LINEAR)
     scale = img.shape[0] / 720
     thick = max(2, int(2 * scale))
+    if zones:
+        overlay = img.copy()
+        for z in zones:
+            pts = (np.array(z["points"]) * [img.shape[1], img.shape[0]]).astype(np.int32)
+            colour = (0, 0, 255) if z["type"] == "restricted" else (0, 200, 255)
+            cv2.fillPoly(overlay, [pts], colour)
+            cv2.polylines(img, [pts], True, colour, thick)
+            cv2.putText(img, z["name"], tuple(pts[0] + [6, int(22 * scale)]), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.6 * scale, colour, 2)
+        img = cv2.addWeighted(overlay, 0.18, img, 0.82, 0)
     for v in vehicles:
         x1, y1, x2, y2 = (int(c * f) for c in v["box"])
         c = VEHICLE_COLOURS[v["status"]]
@@ -140,8 +161,23 @@ def draw(frame: np.ndarray, people: list[dict], vehicles: list[dict], width: int
     for p in people:
         x1, y1, x2, y2 = (int(c * f) for c in p["box"])
         c = PERSON_COLOURS[p["number"] % len(PERSON_COLOURS)]
-        cv2.rectangle(img, (x1, y1), (x2, y2), c, thick)
-        _label(img, f"Person {p['number']} {int(p['score'] * 100)}%", x1, y1, c, scale)
+        if p.get("kpts"):
+            k = [(int(x * f), int(y * f), s) for x, y, s in p["kpts"]]
+            for a, b in SKELETON:
+                if k[a][2] >= 0.4 and k[b][2] >= 0.4:
+                    cv2.line(img, k[a][:2], k[b][:2], c, max(1, thick - 1), cv2.LINE_AA)
+            for x, y, s in k:
+                if s >= 0.4:
+                    cv2.circle(img, (x, y), max(2, thick), c, -1, cv2.LINE_AA)
+        alarm = bool(p.get("alerts")) or bool(p.get("restricted"))
+        cv2.rectangle(img, (x1, y1), (x2, y2), (0, 0, 255) if alarm else c, thick + (2 if alarm else 0))
+        text = f"Person {p['number']} {int(p['score'] * 100)}%"
+        if p.get("doing"):
+            text += f"  {p['doing']}"
+        _label(img, text, x1, y1, (0, 0, 255) if alarm else c, scale)
+        if alarm:
+            warn = ", ".join([LABELS.get(a, a) for a in p.get("alerts", [])] + [f"in {z}" for z in p.get("restricted", [])])
+            _label(img, warn.upper() + "!", x1, y2 + int(26 * scale), (0, 0, 255), scale)
     banner = f"{datetime.now():%d %b %H:%M:%S}   People: {len(people)}   Vehicles: {len(vehicles)}"
     for colour, w in (((0, 0, 0), 4), ((255, 255, 255), 2)):
         cv2.putText(img, banner, (8, int(24 * scale)), cv2.FONT_HERSHEY_SIMPLEX, 0.6 * scale, colour, w)
@@ -150,15 +186,24 @@ def draw(frame: np.ndarray, people: list[dict], vehicles: list[dict], width: int
 
 def render_loop(grabber: FrameGrabber, state: LiveState, recorder: Recorder | None) -> None:
     """Draws the latest boxes on the newest frame → live view + recording with boxes."""
-    period, last_seq = 1.0 / DISPLAY_FPS, -1
+    period, last_seq, last_raw = 1.0 / DISPLAY_FPS, -1, 0.0
     while True:
         t0 = time.time()
         frame, seq = grabber.latest()
         if frame is not None and seq != last_seq:
             last_seq = seq
+            if t0 - last_raw > 2:  # plain picture (no boxes) for drawing zones on the dashboard
+                last_raw = t0
+                small = cv2.resize(frame, (DISPLAY_WIDTH, int(frame.shape[0] * DISPLAY_WIDTH / frame.shape[1])),
+                                   interpolation=cv2.INTER_AREA)
+                ok_r, raw = cv2.imencode(".jpg", small, [cv2.IMWRITE_JPEG_QUALITY, 80])
+                if ok_r:
+                    with state.lock:
+                        state.raw_jpeg = raw.tobytes()
             with state.lock:
-                people, vehicles = state.people, state.vehicles
-            ok, buf = cv2.imencode(".jpg", draw(frame, people, vehicles), [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
+                people, vehicles, zones = state.people, state.vehicles, state.zones
+            ok, buf = cv2.imencode(".jpg", draw(frame, people, vehicles, zones=zones),
+                                   [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
             if ok:
                 jpeg = buf.tobytes()
                 with state.lock:
@@ -201,11 +246,33 @@ def to_detections(dets):
             for x1, y1, x2, y2, s, c in dets]
 
 
-def tracked(tracks):
+def tracked(tracks, current=None, last_fresh=None, now=0.0, keep=1.0):
+    """Tracked objects to show. A track not matched to a detection this frame (person just left or
+    hidden) is kept for `keep` seconds so boxes don't flicker, then hidden. Yields (track, box, score, fresh)."""
+    ids = {id(d) for d in current} if current is not None else None
     for t in tracks:
-        if t.last_detection is not None and t.id is not None:
-            (x1, y1), (x2, y2) = t.estimate.astype(int)
-            yield t, [int(x1), int(y1), int(x2), int(y2)], float(t.last_detection.scores[0])
+        if t.last_detection is None or t.id is None:
+            continue
+        fresh = ids is None or id(t.last_detection) in ids
+        if last_fresh is not None:
+            if fresh:
+                last_fresh[t.id] = now
+            elif now - last_fresh.get(t.id, now) > keep:
+                continue
+        (x1, y1), (x2, y2) = t.estimate.astype(int)
+        yield t, [int(x1), int(y1), int(x2), int(y2)], float(t.last_detection.scores[0]), fresh
+
+
+def duration(seconds: float) -> str:
+    seconds = int(seconds)
+    return f"{seconds} s" if seconds < 60 else f"{seconds // 60} min" if seconds < 3600 else f"{seconds // 3600} h {seconds % 3600 // 60} min"
+
+
+def iou(a, b) -> float:
+    x1, y1, x2, y2 = max(a[0], b[0]), max(a[1], b[1]), min(a[2], b[2]), min(a[3], b[3])
+    inter = max(0.0, x2 - x1) * max(0.0, y2 - y1)
+    union = (a[2] - a[0]) * (a[3] - a[1]) + (b[2] - b[0]) * (b[3] - b[1]) - inter
+    return inter / union if union > 0 else 0.0
 
 
 def stamp(dt: datetime) -> str:
@@ -219,8 +286,22 @@ def main() -> None:
     db = DB(DB_PATH)
     notifier = Notifier(NTFY_SERVER, NTFY_TOPIC, db, DATA_DIR, NTFY_PUBLIC_URL)
     log.info("Phone alerts go to %s (subscribe in the ntfy app: %s)", notifier.url, notifier.subscribe_url)
-    detector = Detector(MODEL_PATH, conf=MIN_SCORE)
+    detector = Detector(MODEL_PATH, conf=min(MIN_SCORE, LOW_SCORE))
     log.info("Detector ready – people + vehicles")
+    pose = None
+    if POSE and os.path.exists(POSE_MODEL):
+        pose = PoseEstimator(POSE_MODEL)
+        log.info("Pose model ready – behaviour detection on")
+    elif POSE:
+        log.warning("Pose model %s missing – behaviour detection uses movement only", POSE_MODEL)
+    analyzer = BehaviourAnalyzer(loiter_seconds=LOITER_SECONDS)
+    camera_motion = CameraMotion()
+    zone_store = ZoneStore(ZONES_PATH)
+    last_behaviour_alert: dict[str, float] = {}
+    prev_person_boxes: list = []
+    last_fresh: dict[int, float] = {}    # people: track id → last time the detector really saw them
+    last_fresh_v: dict[int, float] = {}  # vehicles: same
+    last_state: dict[int, dict] = {}     # people: last behaviour state, shown while briefly hidden
 
     hit_max = int(FPS * 3)
     people_tracker = Tracker(distance_function="iou", distance_threshold=0.75, initialization_delay=2, hit_counter_max=hit_max)
@@ -240,7 +321,7 @@ def main() -> None:
     vehicle_rows: dict[int, dict] = {}
 
     state = LiveState()
-    serve(App(state, db, notifier, RECORDINGS_DIR, CAMERA, RECORD_KEEP_DAYS), PORT)
+    serve(App(state, db, notifier, RECORDINGS_DIR, CAMERA, RECORD_KEEP_DAYS, zone_store), PORT)
     log.info("Dashboard on port %d", PORT)
     jobs: queue.Queue = queue.Queue(maxsize=8)
     if PLATES:
@@ -262,18 +343,46 @@ def main() -> None:
                      frame.shape[1], frame.shape[0], grabber.fps, grabber.lag, grabber.skips)
         dets = detector.detect(frame)
         now, ts = datetime.now(), time.time()
+        # strong detections always count; weak ones only if they overlap someone already tracked
+        # (keeps hold of a person who falls or crouches, when the detector is less sure)
+        person_dets = [d for d in dets if d[5] == PERSON and
+                       (d[4] >= MIN_SCORE or any(iou(d[:4], b) > 0.3 for b in prev_person_boxes))]
+        dets = [d for d in dets if d[5] != PERSON and d[4] >= MIN_SCORE]
 
         # ---- track people + vehicles
-        people, vehicles, decided = [], [], []
-        for t, box, score in tracked(people_tracker.update(to_detections([d for d in dets if d[5] == PERSON]))):
+        people, vehicles, decided, behaviour_events = [], [], [], []
+        zones = zone_store.get()
+        pdets = to_detections(person_dets)
+        for t, box, score, fresh in tracked(people_tracker.update(pdets), pdets, last_fresh, ts):
             num, _ = person_nums.number_for(t.id, now)
-            people.append({"number": num, "box": box, "score": score, "tid": t.id})
-        vtracks = list(tracked(vehicle_tracker.update(to_detections([d for d in dets if d[5] in VEHICLES]))))
+            people.append({"number": num, "box": box, "score": score, "tid": t.id, "fresh": fresh})
+        prev_person_boxes = [p["box"] for p in people if p["fresh"]]
+        seen = [p for p in people if p["fresh"]]  # pose + behaviour only from what the detector saw this frame
+        poses = pose.estimate(frame, [p["box"] for p in seen]) if pose is not None and seen else []
+        cam_offset, jumped = camera_motion.update(frame)
+        if jumped:
+            analyzer.reset_motion()
+        for i, p in enumerate(seen):
+            pts, sc = poses[i] if i < len(poses) else (None, None)
+            st, new = analyzer.update(p["tid"], ts, p["box"], pts, sc, (frame.shape[1], frame.shape[0]),
+                                      zones, now.time(), cam_offset)
+            p.update(doing=st["doing"], alerts=st["alerts"], zones=st["zones"], seconds=st["seconds"], speed=st["speed"],
+                     restricted=[z.name for z in zones if z.name in st["zones"] and z.kind == "restricted"])
+            if pts is not None:
+                p["kpts"] = [[round(float(x), 1), round(float(y), 1), round(float(s), 2)] for (x, y), s in zip(pts, sc)]
+            last_state[p["tid"]] = {k: p[k] for k in ("doing", "alerts", "zones", "seconds", "speed", "restricted", "kpts") if k in p}
+            behaviour_events += [(p, b) for b in new]
+        for p in people:
+            if not p["fresh"]:  # briefly hidden: keep showing what they were last doing
+                p.update(last_state.get(p["tid"], {}))
+                p.pop("kpts", None)
+        vdets = to_detections([d for d in dets if d[5] in VEHICLES])
+        vtracks = list(tracked(vehicle_tracker.update(vdets), vdets, last_fresh_v, ts))
         with book_lock:
             wl = whitelist.get()
-            for t, box, score in vtracks:
+            for t, box, score, fresh in vtracks:
                 num, _ = vehicle_nums.number_for(t.id, now)
-                if PLATES and not jobs.full() and book.want_grab(t.id, ts):
+                if PLATES and fresh and not jobs.full() and book.want_grab(t.id, ts):
                     crop = crop_scaled(frame, box, (frame.shape[1], frame.shape[0])).copy()
                     if crop.size:
                         jobs.put_nowait((t.id, crop))
@@ -285,6 +394,7 @@ def main() -> None:
 
         with state.lock:
             state.people, state.vehicles = people, vehicles
+            state.zones = [{"name": z.name, "type": z.kind, "points": z.points} for z in zones]
 
         # ---- recording (start before logging so new rows point at the clip)
         if recorder is not None:
@@ -360,12 +470,49 @@ def main() -> None:
         for rows in (people_rows, vehicle_rows):
             for tid in [k for k, r in rows.items() if ts - r["seen"] > GONE_AFTER]:
                 r = rows.pop(tid)
+                if rows is people_rows:
+                    analyzer.forget(tid)
+                    last_state.pop(tid, None)
+                    last_fresh.pop(tid, None)
+                else:
+                    last_fresh_v.pop(tid, None)
                 db.update("events", r["id"], confidence=round(r["max"], 3),
                           last_seen=stamp(datetime.fromtimestamp(r["seen"])))
 
+        # ---- behaviours: log each one, add to the person's row, alert on the serious ones
+        for p, b in behaviour_events:
+            zone = next((z for z in zones if b == f"entered {z.name}"), None)
+            label = LABELS.get(b, b)
+            row = people_rows.get(p["tid"])
+            db.insert("events", ts=stamp(now), last_seen=stamp(now), camera=CAMERA, kind="behaviour",
+                      number=p["number"], label=label, confidence=round(p["score"], 3), clip=clip,
+                      details=(f"{zone.kind} zone" if zone else p.get("doing", "")),
+                      status=("alert" if (zone and zone.kind == "restricted") or b in ("lying down", "climbing") else ""))
+            if row is not None:
+                row.setdefault("actions", [])
+                if label not in row["actions"]:
+                    row["actions"].append(label)
+                    db.update("events", row["id"], actions=", ".join(row["actions"]))
+            log.info("Person %d: %s", p["number"], label)
+            kind = "restricted zone" if zone and zone.kind == "restricted" else b
+            if kind in BEHAVIOUR_ALERTS:
+                # safety alerts are per person; loitering / zone alerts once per cooldown (no spam for groups)
+                key = f"{kind}:{p['number']}" if kind in ("lying down", "climbing") else f"{kind}:{b}"
+                if ts - last_behaviour_alert.get(key, -1e18) >= BEHAVIOUR_ALERT_COOLDOWN:
+                    last_behaviour_alert[key] = ts
+                    title = {"lying down": f"Possible fall: Person {p['number']} lying down",
+                             "climbing": f"Person {p['number']} climbing",
+                             "loitering": f"Loitering: Person {p['number']} in view for {duration(p.get('seconds', 0))}",
+                             }.get(kind, f"Person {p['number']} entered {zone.name if zone else ''}".strip())
+                    ok, b2 = cv2.imencode(".jpg", draw(frame, people, vehicles, zones=state.zones),
+                                          [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
+                    notifier.send(title, f"{CAMERA} - {p['score']:.0%} sure it's a person - {now:%d %b %H:%M:%S}",
+                                  b2.tobytes() if ok else b"", "warning")
+
         # person alert
         if new_people and person_policy.should_alert(now):
-            ok, b = cv2.imencode(".jpg", draw(frame, people, vehicles), [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
+            ok, b = cv2.imencode(".jpg", draw(frame, people, vehicles, zones=state.zones),
+                                 [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
             best = max(p["score"] for p in people if p["number"] in new_people)
             notifier.send(f"Person seen: {', '.join(f'Person {n}' for n in new_people)}",
                           f"{CAMERA} - {len(people)} people in view - {best:.0%} sure - {now:%d %b %H:%M:%S}",

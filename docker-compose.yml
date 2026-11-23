@@ -67,6 +67,9 @@ services:
       PLATE_ALERT_COOLDOWN: "3600"     # don't re-alert the same unknown plate within an hour
       PLATE_MIN_SCORE: "0.7"           # how sure a plate read must be before deciding
       FPS: "5"                         # detections per second
+      POSE: "1"                        # body pose → guess what people are doing
+      LOITER_SECONDS: "120"            # "loitering" after this long in view
+      BEHAVIOUR_ALERTS: "lying down,climbing,restricted zone,loitering"   # which behaviours send phone alerts
       WHITELIST_PATH: /settings/whitelist.yaml
       DB_PATH: /data/vision.db
       RECORD: "1"                      # save 4K video while a person/vehicle is in view
@@ -74,7 +77,7 @@ services:
       RECORD_KEEP_RAW: "1"             # also keep the original 4K video (no boxes) next to each clip
       RECORD_KEEP_DAYS: "30"           # delete recordings older than this
     volumes:
-      - ./settings:/settings:ro
+      - ./settings:/settings          # whitelist.yaml + zones.yaml (zones are saved from the dashboard)
       - ./data:/data
       - ./recordings:/recordings       # recordings/YYYY-MM-DD/HH-MM-SS.mp4 (with boxes) + _4k.mp4 (original)
     ports:

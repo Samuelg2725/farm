@@ -9,6 +9,7 @@ Everything is **free and open source**, and runs on site with no cloud and no su
 | **vision** (our code) | ONE live view that does **both at once**: numbered boxes round people (Person 1, 2…) **and** boxes round vehicles with their number plate + KNOWN / UNKNOWN. Sends alerts. | ours |
 | ├ [YOLOX](https://github.com/Megvii-BaseDetection/YOLOX) | finds people **and** vehicles in one pass | Apache-2.0 |
 | ├ [Norfair](https://github.com/tryolabs/norfair) | follows each person/vehicle between frames so they keep their number | BSD-3 |
+| ├ [RTMPose](https://github.com/open-mmlab/mmpose/tree/main/projects/rtmpose) | body pose (17 points) → what each person is doing | Apache-2.0 |
 | └ [FastALPR](https://github.com/ankandrew/fast-alpr) | finds + reads the number plate from a 4K crop of each vehicle | MIT |
 | [Frigate](https://github.com/blakeblackshear/frigate) | records 24/7, review/playback of events, PTZ control | MIT |
 | [ntfy](https://github.com/binwiederhier/ntfy) | push alerts with photo to phones | Apache-2.0 / GPL-2.0 |
@@ -130,6 +131,35 @@ Private plates move between cars, so the date belongs to the plate. Colour is es
 `recordings/YYYY-MM-DD/`: `HH-MM-SS.mp4` (with boxes, 1080p) and `HH-MM-SS_4k.mp4` (original camera video).
 Kept 30 days (`RECORD_KEEP_DAYS`). Allow roughly 3–5 GB per hour of activity.
 
+### What people are doing
+
+Each person's label shows what they're doing, e.g. **Person 3 90% walking** or **Person 2 crouching**, with a skeleton drawn on.
+
+| Behaviour | How it's worked out | Alert by default |
+|---|---|---|
+| standing still / walking / running | how fast their feet move (in body-heights per second), with camera panning subtracted | – (logged) |
+| crouching | hips close to ankles (body pose) | – (logged) |
+| **lying down (possible fall)** | body horizontal for 4+ s | ✅ |
+| **climbing** | one leg raised high + a hand above the shoulder for 2+ s | ✅ |
+| arms raised | both hands above the head | – (logged) |
+| **loitering** | in view for 2+ minutes (`LOITER_SECONDS`) | ✅ |
+| **entered a restricted zone** | feet inside a zone you drew (Zones tab) | ✅ |
+
+Everything appears in the **Activity log** (e.g. *Person 3 → lying down (possible fall)*) and in each person's row.
+Choose which ones alert with `BEHAVIOUR_ALERTS` in `docker-compose.yml`.
+
+How reliable is it? Movement, loitering and zones are reliable. Pose-based ones (crouching, lying, climbing) are good
+when the person is reasonably big in the picture and not cut off by the edge; they get less reliable far away or at night.
+People cut off by the picture edge are never called crouching/lying (missing legs would look like it).
+A person already lying down when they first come into view may not be detected at all – falls are caught best when
+the camera sees them standing first.
+
+### Zones
+
+**Zones tab** → click corners on the camera picture → name it → *Restricted* (alert) or *Watch* (log only) → optional
+hours like `18:00-07:00` → Save. Works straight away. Saved in `settings/zones.yaml`.
+Zones are fixed to the picture, so draw them with the PTZ at its home/gate position.
+
 ### Owner's cars (whitelist)
 
 Edit `settings/whitelist.yaml` (`open -e settings/whitelist.yaml` on Mac):
@@ -177,6 +207,9 @@ You get:
 | `PERSON_ALERT_COOLDOWN` | 300 | seconds between person alerts |
 | `ALPR_OCR_MODEL` | cct-s-v2-global-model | plate OCR model (global, recognises UK plates) |
 | `PLATES` | 1 | 0 = turn plate reading off |
+| `POSE` | 1 | 0 = turn body pose off (movement, loitering and zones still work) |
+| `LOITER_SECONDS` | 120 | in view this long = loitering |
+| `BEHAVIOUR_ALERTS` | lying down,climbing,restricted zone,loitering | which behaviours send phone alerts (also: running, crouching, arms raised) |
 | `RECORD` / `RECORD_KEEP_RAW` | 1 / 1 | turn recording off / don't keep the original 4K copy |
 | `RECORD_KEEP_DAYS` | 30 | delete recordings older than this |
 
