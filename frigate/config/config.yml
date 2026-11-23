@@ -1,0 +1,78 @@
+# Frigate config – Reolink RLC-823S2 starter.
+# {FRIGATE_*} values come from .env via docker-compose.
+
+mqtt:
+  enabled: true
+  host: mqtt
+
+go2rtc:
+  streams:
+    # 4K main stream (H.265) – used for recording
+    yard_ptz:
+      - rtsp://{FRIGATE_CAM_USER}:{FRIGATE_CAM_PASS}@{FRIGATE_CAM_IP}:554/Preview_01_main
+    # low-res sub stream – used for detection (cheap to decode)
+    yard_ptz_sub:
+      - rtsp://{FRIGATE_CAM_USER}:{FRIGATE_CAM_PASS}@{FRIGATE_CAM_IP}:554/Preview_01_sub
+
+# Start on CPU. On an Intel mini PC switch to OpenVINO (see README).
+detectors:
+  cpu1:
+    type: cpu
+
+# Licence plate recognition (runs on detected cars)
+lpr:
+  enabled: true
+  min_plate_length: 4
+  recognition_threshold: 0.85
+  # UK current-style plates only (AB12CDE). Leave off while testing – private
+  # and older plates would be ignored.
+  # format: "^[A-Z]{2}[0-9]{2}[A-Z]{3}$"
+
+objects:
+  track: [person, car, truck, motorcycle]
+
+record:
+  enabled: true
+  retain:
+    days: 3
+    mode: motion
+  alerts:
+    retain:
+      days: 30
+  detections:
+    retain:
+      days: 30
+
+snapshots:
+  enabled: true
+  bounding_box: true
+  timestamp: true
+  retain:
+    default: 30
+
+cameras:
+  yard_ptz:
+    ffmpeg:
+      # hwaccel_args: preset-vaapi     # uncomment with Intel GPU
+      inputs:
+        - path: rtsp://127.0.0.1:8554/yard_ptz
+          input_args: preset-rtsp-restream
+          roles: [record]
+        - path: rtsp://127.0.0.1:8554/yard_ptz_sub
+          input_args: preset-rtsp-restream
+          roles: [detect]
+    detect:
+      enabled: true
+      width: 640      # set to your sub stream resolution
+      height: 360
+      fps: 5
+    lpr:
+      enabled: true
+    # PTZ control from the Frigate UI. Use the camera's own auto-tracking
+    # (Reolink app) – Frigate's autotracker needs ONVIF features Reolink lacks.
+    onvif:
+      host: "{FRIGATE_CAM_IP}"
+      port: 8000
+      user: "{FRIGATE_CAM_USER}"
+      password: "{FRIGATE_CAM_PASS}"
+    # Zones (gate, yard…) get added here once we know the site layout.

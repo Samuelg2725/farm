@@ -1,2 +1,7 @@
+.env
+storage/
+frigate/config/*.db*
+frigate/config/model_cache/
+__pycache__/
 data/*
 !data/.gitkeep

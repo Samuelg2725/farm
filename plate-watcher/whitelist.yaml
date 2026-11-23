@@ -1,0 +1,7 @@
+# Vehicles allowed on site. Anything not here triggers an alert.
+# Edits are picked up automatically – no restart needed.
+vehicles:
+  - plate: AB12 CDE
+    owner: Example – owner's car (replace me)
+  # - plate: YX19 ABC
+  #   owner: Livestock haulier – J Smith

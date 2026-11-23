@@ -1,0 +1,69 @@
+services:
+  frigate:
+    image: ghcr.io/blakeblackshear/frigate:0.16.1   # check for newer stable release
+    container_name: frigate
+    restart: unless-stopped
+    shm_size: "512mb"
+    # Uncomment on an Intel mini PC for hardware video decode + OpenVINO detection:
+    # devices:
+    #   - /dev/dri/renderD128:/dev/dri/renderD128
+    volumes:
+      - ./frigate/config:/config
+      - ./storage:/media/frigate
+      - type: tmpfs
+        target: /tmp/cache
+        tmpfs:
+          size: 1000000000
+    ports:
+      - "8971:8971"   # Frigate web UI (HTTPS, login required)
+      - "8554:8554"   # RTSP restream (optional)
+    environment:
+      TZ: ${TZ:-Europe/London}
+      FRIGATE_CAM_IP: ${CAM_IP}
+      FRIGATE_CAM_USER: ${CAM_USER}
+      FRIGATE_CAM_PASS: ${CAM_PASS}
+    depends_on: [mqtt]
+
+  mqtt:
+    image: eclipse-mosquitto:2.0.20
+    container_name: mqtt
+    restart: unless-stopped
+    volumes:
+      - ./mosquitto/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+    # Not exposed outside the Docker network on purpose.
+
+  # Open-source push notifications (phone app: "ntfy" on Android / iOS / F-Droid)
+  ntfy:
+    image: binwiederhier/ntfy:v2.11.0
+    container_name: ntfy
+    command: serve
+    restart: unless-stopped
+    environment:
+      TZ: ${TZ:-Europe/London}
+      NTFY_BASE_URL: http://${HOST_IP:-localhost}:8080
+      NTFY_ATTACHMENT_CACHE_DIR: /var/cache/ntfy/attachments
+    volumes:
+      - ./data/ntfy:/var/cache/ntfy
+    ports:
+      - "8080:80"
+
+  plate-watcher:
+    build: ./plate-watcher
+    container_name: plate-watcher
+    restart: unless-stopped
+    environment:
+      TZ: ${TZ:-Europe/London}
+      MQTT_HOST: mqtt
+      FRIGATE_URL: http://frigate:5000
+      NTFY_URL: http://ntfy/${NTFY_TOPIC:-farm-alerts}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN}
+      TELEGRAM_CHAT_ID: ${TELEGRAM_CHAT_ID}
+      WHITELIST_PATH: /app/whitelist.yaml
+      DB_PATH: /data/sightings.db
+      OWN_ALPR: "1"                       # free FastALPR on 4K frames
+      STREAM_URL: rtsp://frigate:8554/{camera}
+      DETECT_SIZE: 640x360                # must match detect width x height in Frigate config
+    volumes:
+      - ./plate-watcher/whitelist.yaml:/app/whitelist.yaml:ro
+      - ./data:/data
+    depends_on: [mqtt, frigate, ntfy]
