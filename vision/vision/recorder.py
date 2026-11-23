@@ -1,126 +1,171 @@
-"""Records the camera's original 4K video while a person or vehicle is in view.
+"""Records while a person or vehicle is in view – two files per clip:
 
-Uses ffmpeg in "copy" mode: the camera's video is saved as-is (no re-encoding),
-so it's full quality and uses almost no CPU. Clips go in /recordings/YYYY-MM-DD/.
+  HH-MM-SS.mp4      the live view WITH boxes, labels and plates drawn on (1080p H.264)
+  HH-MM-SS_4k.mp4   the camera's original 4K video, copied as-is (evidence quality, no CPU)
+  HH-MM-SS.jpg      thumbnail
+
+Files go in /recordings/YYYY-MM-DD/. Old days are deleted after `keep_days`.
 """
 from __future__ import annotations
 
 import logging
+import queue
 import shutil
 import subprocess
+import threading
 from datetime import datetime, timedelta
 from pathlib import Path
 
 log = logging.getLogger("vision")
 
+_FRAG = ["-movflags", "+frag_keyframe+empty_moov+default_base_moof"]  # playable even while still recording
 
-def ffmpeg_cmd(url: str, out: Path, codec: str) -> list[str]:
+
+def raw_cmd(url: str, out: Path, codec: str) -> list[str]:
     cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin"]
-    if url.startswith("rtsp"):
-        cmd += ["-rtsp_transport", "tcp"]
-    else:  # a test video file: play it at real speed
-        cmd += ["-re"]
+    cmd += ["-rtsp_transport", "tcp"] if url.startswith("rtsp") else ["-re"]  # -re: test files at real speed
     cmd += ["-i", url, "-map", "0:v", "-map", "0:a?", "-c", "copy"]
     if codec == "hevc":
         cmd += ["-tag:v", "hvc1"]  # lets Safari / QuickTime play H.265
-    cmd += ["-movflags", "+frag_keyframe+empty_moov+default_base_moof", "-f", "mp4", str(out)]
-    return cmd
+    return cmd + _FRAG + ["-f", "mp4", str(out)]
 
 
-def clip_name(start: datetime, labels: set[str]) -> str:
-    what = "+".join(sorted(labels)) or "motion"
-    return f"{start:%H-%M-%S}_{what}"
+def annotated_cmd(out: Path) -> list[str]:
+    return ["ffmpeg", "-hide_banner", "-loglevel", "error",
+            # millisecond timestamps from the real clock (frames arrive at a varying rate)
+            "-f", "image2pipe", "-framerate", "1000", "-use_wallclock_as_timestamps", "1", "-c:v", "mjpeg", "-i", "-",
+            "-c:v", "libx264", "-preset", "veryfast", "-crf", "25", "-pix_fmt", "yuv420p", "-bf", "0",
+            "-g", "24", "-fps_mode", "passthrough", "-video_track_timescale", "1000", *_FRAG, "-f", "mp4", str(out)]
+
+
+class _AnnotatedWriter:
+    """Feeds rendered JPEG frames to ffmpeg on a background thread (never blocks the live view)."""
+
+    def __init__(self, out: Path):
+        self.proc = subprocess.Popen(annotated_cmd(out), stdin=subprocess.PIPE,
+                                     stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        self.q: queue.Queue = queue.Queue(maxsize=30)
+        self.t = threading.Thread(target=self._run, daemon=True)
+        self.t.start()
+
+    def _run(self):
+        while True:
+            frame = self.q.get()
+            if frame is None:
+                break
+            try:
+                self.proc.stdin.write(frame)
+            except (BrokenPipeError, ValueError):
+                break
+
+    def feed(self, jpeg: bytes) -> None:
+        try:
+            self.q.put_nowait(jpeg)
+        except queue.Full:
+            pass  # drop a frame rather than lag
+
+    def close(self) -> str:
+        self.q.put(None)
+        self.t.join(timeout=10)
+        try:
+            self.proc.stdin.close()
+        except Exception:
+            pass
+        try:
+            self.proc.wait(timeout=20)
+        except subprocess.TimeoutExpired:
+            self.proc.kill()
+        return self.proc.stderr.read().decode(errors="replace").strip() if self.proc.stderr else ""
 
 
 class Recorder:
     def __init__(self, url: str, out_dir: str, post_roll: float = 10, max_length: float = 600,
-                 keep_days: int = 30, enabled: bool = True):
+                 keep_days: int = 30, enabled: bool = True, keep_raw: bool = True):
         self.url, self.out_dir = url, Path(out_dir)
-        self.post_roll, self.max_length, self.keep_days, self.enabled = post_roll, max_length, keep_days, enabled
-        self.proc: subprocess.Popen | None = None
-        self.path: Path | None = None
+        self.post_roll, self.max_length, self.keep_days = post_roll, max_length, keep_days
+        self.enabled, self.keep_raw = enabled, keep_raw
+        self.raw: subprocess.Popen | None = None
+        self.annotated: _AnnotatedWriter | None = None
+        self.clip: str = ""             # e.g. "2026-11-23/12-25-43.mp4" (relative to out_dir)
         self.started: datetime | None = None
         self.last_active: datetime | None = None
-        self.labels: set[str] = set()
         self.codec = "h264"
+        self.lock = threading.Lock()
         if enabled and not shutil.which("ffmpeg"):
             log.error("ffmpeg not installed – recording disabled")
             self.enabled = False
 
     @property
     def recording(self) -> bool:
-        return self.proc is not None
+        return bool(self.clip)
 
-    def update(self, now: datetime, labels: set[str], snapshot_jpeg: bytes = b"") -> tuple[str, Path] | None:
-        """Call every frame with what's in view. Returns ("started"|"stopped", path) when that happens."""
+    def feed(self, jpeg: bytes) -> None:
+        """Called by the live view for every frame it draws."""
+        with self.lock:
+            if self.annotated is not None:
+                self.annotated.feed(jpeg)
+
+    def update(self, now: datetime, active: bool, thumb_jpeg: bytes = b"") -> tuple[str, dict] | None:
+        """Call every detection cycle. Returns ("started"|"stopped", clip_info) when that happens."""
         if not self.enabled:
             return None
-        if self.proc is not None and self.proc.poll() is not None:  # ffmpeg died (stream dropped?)
-            log.warning("Recording process ended unexpectedly")
-            return self._stop(now)
-        if labels:
+        if active:
             self.last_active = now
-            self.labels |= labels
-            if self.proc is None:
-                return self._start(now, labels, snapshot_jpeg)
+            if not self.recording:
+                return self._start(now, thumb_jpeg)
             if (now - self.started).total_seconds() > self.max_length:
-                return self._stop(now)  # a new clip starts next frame
-        elif self.proc is not None and (now - self.last_active).total_seconds() > self.post_roll:
+                return self._stop(now)  # a fresh clip starts next cycle
+        elif self.recording and (now - self.last_active).total_seconds() > self.post_roll:
             return self._stop(now)
         return None
 
-    def _start(self, now: datetime, labels: set[str], snapshot_jpeg: bytes):
+    def _start(self, now: datetime, thumb_jpeg: bytes):
         self.cleanup(now)
         day = self.out_dir / f"{now:%Y-%m-%d}"
         day.mkdir(parents=True, exist_ok=True)
-        self.path = day / (clip_name(now, labels) + ".mp4")
-        if snapshot_jpeg:
-            self.path.with_suffix(".jpg").write_bytes(snapshot_jpeg)
-        self.proc = subprocess.Popen(ffmpeg_cmd(self.url, self.path, self.codec),
-                                     stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-        self.started, self.labels = now, set(labels)
-        log.info("Recording started: %s", self.path)
-        return "started", self.path
+        base = day / f"{now:%H-%M-%S}"
+        info = {"file": f"{base.relative_to(self.out_dir)}.mp4", "raw_file": "", "thumb": ""}
+        if thumb_jpeg:
+            base.with_suffix(".jpg").write_bytes(thumb_jpeg)
+            info["thumb"] = f"{base.relative_to(self.out_dir)}.jpg"
+        with self.lock:
+            self.annotated = _AnnotatedWriter(base.with_suffix(".mp4"))
+        if self.keep_raw:
+            raw_path = base.parent / f"{base.name}_4k.mp4"
+            self.raw = subprocess.Popen(raw_cmd(self.url, raw_path, self.codec), stdin=subprocess.DEVNULL,
+                                        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+            info["raw_file"] = str(raw_path.relative_to(self.out_dir))
+        self.clip, self.started = info["file"], now
+        log.info("Recording started: %s", info["file"])
+        return "started", info
 
     def _stop(self, now: datetime):
-        proc, path = self.proc, self.path
-        self.proc = None
-        if proc.poll() is None:
-            proc.terminate()  # ffmpeg finishes the file cleanly on SIGTERM
-            try:
-                proc.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-        err = proc.stderr.read().decode(errors="replace").strip() if proc.stderr else ""
-        if err:
-            log.warning("ffmpeg: %s", err[-300:])
-        # rename so the file name lists everything seen during the clip
-        final = path.with_name(clip_name(self.started, self.labels) + ".mp4")
-        if final != path and path.exists():
-            path.rename(final)
-            if path.with_suffix(".jpg").exists():
-                path.with_suffix(".jpg").rename(final.with_suffix(".jpg"))
-        log.info("Recording stopped: %s (%.0f s)", final, (now - self.started).total_seconds())
-        return "stopped", final
+        with self.lock:
+            writer, self.annotated = self.annotated, None
+        errors = [writer.close()] if writer else []
+        if self.raw is not None:
+            if self.raw.poll() is None:
+                self.raw.terminate()  # ffmpeg closes the file cleanly on SIGTERM
+                try:
+                    self.raw.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    self.raw.kill()
+            errors.append(self.raw.stderr.read().decode(errors="replace").strip() if self.raw.stderr else "")
+            self.raw = None
+        for e in filter(None, errors):
+            log.warning("ffmpeg: %s", e[-300:])
+        info = {"file": self.clip, "seconds": round((now - self.started).total_seconds())}
+        log.info("Recording stopped: %s (%d s)", self.clip, info["seconds"])
+        self.clip = ""
+        return "stopped", info
 
-    def cleanup(self, now: datetime) -> None:
+    def cleanup(self, now: datetime) -> list[str]:
         cutoff = (now - timedelta(days=self.keep_days)).strftime("%Y-%m-%d")
-        if not self.out_dir.exists():
-            return
-        for d in self.out_dir.iterdir():
-            if d.is_dir() and d.name < cutoff:
-                shutil.rmtree(d, ignore_errors=True)
-                log.info("Deleted old recordings %s", d.name)
-
-    def list_clips(self, limit: int = 200) -> list[dict]:
-        if not self.out_dir.exists():
-            return []
-        clips = sorted(self.out_dir.glob("*/*.mp4"), reverse=True)[:limit]
-        out = []
-        for c in clips:
-            rel = c.relative_to(self.out_dir).as_posix()
-            thumb = c.with_suffix(".jpg")
-            out.append({"file": rel, "day": c.parent.name, "name": c.stem, "size_mb": round(c.stat().st_size / 1e6, 1),
-                        "thumb": thumb.relative_to(self.out_dir).as_posix() if thumb.exists() else "",
-                        "live": self.path is not None and c == self.path and self.recording})
-        return out
+        removed = []
+        if self.out_dir.exists():
+            for d in self.out_dir.iterdir():
+                if d.is_dir() and d.name < cutoff:
+                    shutil.rmtree(d, ignore_errors=True)
+                    removed.append(d.name)
+                    log.info("Deleted old recordings %s", d.name)
+        return removed

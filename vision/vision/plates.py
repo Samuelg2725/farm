@@ -35,14 +35,16 @@ class PlateReader:
         self.alpr = ALPR(detector_model=DETECTOR_MODEL, ocr_model=OCR_MODEL, detector_conf_thresh=0.3)
         log.info("Plate reader ready (%s / %s)", DETECTOR_MODEL, OCR_MODEL)
 
-    def read(self, image_bgr: np.ndarray) -> list[tuple[str, float]]:
+    def read(self, image_bgr: np.ndarray) -> list[tuple[str, float, str, float]]:
+        """[(plate, confidence, country_guess, country_confidence)]"""
         out = []
         for r in self.alpr.predict(image_bgr):
             if not r.ocr or not r.ocr.text:
                 continue
             conf = r.ocr.confidence
             conf = float(np.mean(conf)) if isinstance(conf, (list, tuple, np.ndarray)) else float(conf)
-            out.append((normalise(r.ocr.text), conf * float(r.detection.confidence) ** 0.5))
+            out.append((normalise(r.ocr.text), conf * float(r.detection.confidence) ** 0.5,
+                        getattr(r.ocr, "region", "") or "", float(getattr(r.ocr, "region_confidence", 0) or 0)))
         return out
 
 
@@ -75,6 +77,9 @@ class PlateInfo:
     grabs: int = 0
     last_grab: float = -1e18
     crop_jpeg: bytes = b""
+    ocr_country: str = ""
+    ocr_country_conf: float = 0.0
+    colour: str = ""
     decided: bool = False
     known: bool = False
     owner: str = ""
@@ -110,13 +115,15 @@ class PlateBook:
         p.last_grab = now
         return True
 
-    def add_read(self, tid: int, plate: str, score: float, now: float, crop_jpeg: bytes = b"") -> None:
+    def add_read(self, tid: int, plate: str, score: float, now: float, crop_jpeg: bytes = b"",
+                 country: str = "", country_conf: float = 0.0) -> None:
         p = self.get(tid, now)
         if p.decided or not plate:
             return
         p.reads += 1
         if score >= p.score:
             p.plate, p.score = plate, score
+            p.ocr_country, p.ocr_country_conf = country, country_conf
             if crop_jpeg:
                 p.crop_jpeg = crop_jpeg
 

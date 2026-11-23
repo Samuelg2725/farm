@@ -106,34 +106,29 @@ Open **https://PC-IP:8971** (accept the certificate warning), log in as `admin`,
 - **Review** tab – every alert/detection with clip and snapshot (boxes drawn on).
 - **Explore** – search past objects.
 
-## 5. The live view (people + plates together)
+## 5. The dashboard – http://localhost:8090
 
-Open **http://localhost:8090** (or `http://HOST_IP:8090` from a phone/laptop on the network).
+One page with everything (works on a phone too: `http://HOST_IP:8090` on the farm Wi-Fi):
 
-- **People**: coloured box labelled **Person 1, Person 2…** – same person keeps their number while in view. Numbers restart each day.
-- **Vehicles**: box labelled **Vehicle 1** plus the plate once read:
-  - yellow `checking...` – plate read, confirming
-  - green `OK <owner>` – on the whitelist
-  - red `UNKNOWN!` – not on the whitelist → alert sent
-  - grey – no plate visible (e.g. side-on)
-- Top bar: time, number of people and vehicles in view. Lists underneath the picture.
-- Everything is logged to `data/vision.db` (tables `people` and `vehicles`).
+| Section | What it shows |
+|---|---|
+| **Live view** | Full-quality camera picture with numbered boxes: **Person 1 90%**, **Vehicle 2 93% KL70XYZ UNKNOWN!** |
+| **In view now** | A card for each person/vehicle with its confidence %, plate, country, region, plate date, colour |
+| **Activity log** | Every person and vehicle seen: time, confidence %, plate details, allowed/unknown, ▶ play the clip |
+| **Vehicles & plates** | Every plate read: country, region registered, when the plate was issued, type, approx colour, vehicle % and plate % |
+| **Recordings** | Clips **with the boxes drawn on**; click to play. Each also has the original 4K (no boxes) |
+| **Phone alerts** | QR code + steps to get alerts on your phone, **Send test alert** button, list of sent alerts (✓ delivered / ✗ failed) |
 
-### Recordings
+Header: camera fps, delay behind live, ● REC while recording, today's totals.
 
-Whenever a person or vehicle is in view, the original **4K video** is saved (copied straight from the camera – full quality, almost no CPU). Recording stops 10 s after they leave.
+**What the plate tells us** (worked out locally, no internet): current UK plates (2001+) like `YX19 ABC` →
+first letter = region first registered (Y = Yorkshire), numbers = when the plate was issued (19 = Mar–Aug 2019,
+69 = Sep 2019–Feb 2020). Older UK formats, Northern Ireland and foreign plates are recognised too.
+Private plates move between cars, so the date belongs to the plate. Colour is estimated from the picture.
 
-- Watch them at **http://localhost:8090/recordings** (or the *Recordings* link on the live view) – click a clip to play.
-- Files are in the `recordings/` folder: `recordings/2026-11-23/12-25-43_person+vehicle.mp4`, with a snapshot `.jpg` (boxes drawn on) next to each.
-- A red **● REC** shows in the live view header while recording.
-- Kept 30 days (`RECORD_KEEP_DAYS`). Roughly 2–4 GB per hour of activity at 4K – keep an eye on disk space.
-- Frigate also keeps its own recordings (https://localhost:8971 → Review).
-
-Watch what it's doing:
-
-```bash
-docker logs -f vision
-```
+**Recordings**: start when a person/vehicle appears, stop 10 s after they leave. Two files per clip in
+`recordings/YYYY-MM-DD/`: `HH-MM-SS.mp4` (with boxes, 1080p) and `HH-MM-SS_4k.mp4` (original camera video).
+Kept 30 days (`RECORD_KEEP_DAYS`). Allow roughly 3–5 GB per hour of activity.
 
 ### Owner's cars (whitelist)
 
@@ -151,27 +146,20 @@ Spaces/case don't matter. One misread character (e.g. B read as 8) still counts 
 
 ## 6. Alerts on your phone (ntfy – free, open source)
 
-Install the **ntfy** app (iPhone App Store, or Android Play Store / F-Droid). Then pick one:
+Open the dashboard → **Phone alerts** tab and follow the steps there:
 
-**Option A – alerts anywhere (easiest, works on iPhone + Android):**
-1. In `.env` set `NTFY_SERVER=https://ntfy.sh` and a long random topic, e.g. `NTFY_TOPIC=farm-k7q2m9x4w1` (anyone who knows the topic can read it, so don't use something guessable).
-2. `docker compose up -d`
-3. In the app: **+** → Topic name = your `NTFY_TOPIC` → leave *Use another server* **unticked** → Subscribe.
-4. Test: `curl -d "test alert" https://ntfy.sh/YOUR_TOPIC`
+1. Install the free **ntfy** app (iPhone App Store / Google Play).
+2. Tap **+**, type the topic name shown on the dashboard, leave *Use another server* **unticked**, Subscribe.
+3. Press **Send test alert** on the dashboard – your phone pings.
 
-Note: alerts (photos, plates) pass through the public ntfy.sh server. Fine for testing; for the real site switch to Option B + a VPN.
-
-**Option B – private, site network only:**
-1. Keep `NTFY_SERVER=http://ntfy` in `.env`.
-2. In the app: **+** → Topic name = your `NTFY_TOPIC` → tick *Use another server* → `http://HOST_IP:8080` → Subscribe.
-3. Test: `curl -d "test alert" http://HOST_IP:8080/farm-alerts`
-Phones only get alerts on the site Wi-Fi (or over a VPN such as WireGuard). On iPhone, alerts may only appear when the app is opened.
+By default alerts go through the free public **ntfy.sh** server, so they reach your phone anywhere (4G, home, etc.).
+A private random topic name is generated for you (saved in `data/ntfy_topic.txt`) so strangers can't read your alerts.
+Note: alert photos/plates pass through ntfy.sh. For a fully private setup set `NTFY_SERVER=http://ntfy` and
+`NTFY_PUBLIC_URL=http://HOST_IP:8080` in `.env` – then phones only get alerts on the farm Wi-Fi (or over a VPN).
 
 You get:
-- **UNKNOWN VEHICLE: <plate>** – with a 4K photo of the vehicle. Same plate won't re-alert for an hour.
-- **Person seen: Person 3** – with the numbered live picture. Choose when in `.env`: `PERSON_ALERT_HOURS=always`, `never`, or e.g. `18:00-07:00` (out of hours only). Max one per 5 minutes.
-
-Phones get alerts while on the site network. For alerts when away, use a free open-source VPN such as WireGuard back to the site.
+- **UNKNOWN VEHICLE: KL70XYZ** – photo of the vehicle + country, region, plate date, colour. Same plate re-alerts at most once an hour.
+- **Person seen: Person 3** – the numbered picture. When: `PERSON_ALERT_HOURS=always`, `never`, or e.g. `18:00-07:00`. Max one per 5 minutes.
 
 ## 7. Tuning knobs
 
@@ -189,6 +177,8 @@ Phones get alerts while on the site network. For alerts when away, use a free op
 | `PERSON_ALERT_COOLDOWN` | 300 | seconds between person alerts |
 | `ALPR_OCR_MODEL` | cct-s-v2-global-model | plate OCR model (global, recognises UK plates) |
 | `PLATES` | 1 | 0 = turn plate reading off |
+| `RECORD` / `RECORD_KEEP_RAW` | 1 / 1 | turn recording off / don't keep the original 4K copy |
+| `RECORD_KEEP_DAYS` | 30 | delete recordings older than this |
 
 **Faster detection on Intel mini PC:** uncomment the `devices:` lines in `docker-compose.yml`, uncomment `hwaccel_args: preset-vaapi`, and replace the `detectors:` block in the Frigate config with:
 

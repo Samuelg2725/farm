@@ -48,7 +48,7 @@ services:
     ports:
       - "8080:80"
 
-  # People tracking + number plate checks together, one live view: http://localhost:8090
+  # People + vehicle tracking, number plates, recordings, alerts – dashboard: http://localhost:8090
   vision:
     build: ./vision
     container_name: vision
@@ -59,7 +59,9 @@ services:
       STREAM_URL: rtsp://frigate:8554/yard_ptz   # 4K main stream: live view, detection and plates
       DISPLAY_WIDTH: "1920"            # live view size: 1920 = 1080p, 2560 = 1440p, 3840 = full 4K
       DISPLAY_FPS: "12"                # live view refresh rate
-      NTFY_URL: ${NTFY_SERVER:-http://ntfy}/${NTFY_TOPIC:-farm-alerts}
+      NTFY_SERVER: ${NTFY_SERVER:-https://ntfy.sh}   # https://ntfy.sh = phones anywhere; http://ntfy = this computer only
+      NTFY_TOPIC: ${NTFY_TOPIC:-}                     # blank = a private random topic is made for you
+      NTFY_PUBLIC_URL: ${NTFY_PUBLIC_URL:-}           # only for http://ntfy: what phones use, e.g. http://10.1.0.50:8080
       PERSON_ALERT_HOURS: ${PERSON_ALERT_HOURS:-always}   # always | never | 18:00-07:00
       PERSON_ALERT_COOLDOWN: "300"     # seconds between person alerts
       PLATE_ALERT_COOLDOWN: "3600"     # don't re-alert the same unknown plate within an hour
@@ -69,11 +71,12 @@ services:
       DB_PATH: /data/vision.db
       RECORD: "1"                      # save 4K video while a person/vehicle is in view
       RECORD_POST_ROLL: "10"           # keep recording this many seconds after they leave
+      RECORD_KEEP_RAW: "1"             # also keep the original 4K video (no boxes) next to each clip
       RECORD_KEEP_DAYS: "30"           # delete recordings older than this
     volumes:
       - ./settings:/settings:ro
       - ./data:/data
-      - ./recordings:/recordings       # clips: recordings/YYYY-MM-DD/HH-MM-SS_person+vehicle.mp4
+      - ./recordings:/recordings       # recordings/YYYY-MM-DD/HH-MM-SS.mp4 (with boxes) + _4k.mp4 (original)
     ports:
       - "8090:8090"
     depends_on: [frigate, ntfy]
