@@ -187,9 +187,25 @@ A private random topic name is generated for you (saved in `data/ntfy_topic.txt`
 Note: alert photos/plates pass through ntfy.sh. For a fully private setup set `NTFY_SERVER=http://ntfy` and
 `NTFY_PUBLIC_URL=http://HOST_IP:8080` in `.env` – then phones only get alerts on the farm Wi-Fi (or over a VPN).
 
-You get:
-- **UNKNOWN VEHICLE: KL70XYZ** – photo of the vehicle + country, region, plate date, colour. Same plate re-alerts at most once an hour.
-- **Person seen: Person 3** – the numbered picture. When: `PERSON_ALERT_HOURS=always`, `never`, or e.g. `18:00-07:00`. Max one per 5 minutes.
+**🔔 Person alerts ON / 🔕 OFF** – the button at the top of the dashboard. It's remembered across restarts.
+Number-plate alerts are always on.
+
+While **ON**, your phone gets:
+- **Person seen: Person 3 - walking** – sent ~2 s after someone appears (so it can say what they're doing), with the
+  picture showing the numbered boxes. People arriving together share one alert; at most one every 20 s.
+- **Person 3 running / crouching / arms raised / climbing / lying down / loitering / entered <zone>** – whenever someone
+  starts doing something (each thing once a minute per person). Falls, climbing and restricted zones are marked ⚠ urgent.
+- **Video** – when the recording ends, the clip **with the boxes drawn on** is sent too (made smaller if needed to fit
+  the 15 MB limit; long clips: first 90 s).
+
+Always (whatever the button):
+- **UNKNOWN VEHICLE: KL70XYZ** – photo of the vehicle with the **number plate enlarged**, plus country, region,
+  plate date and colour – then the **video** when the clip ends. Same plate re-alerts at most once an hour.
+
+While OFF, everything is still logged and recorded – your phone just isn't pinged for people.
+`PERSON_ALERT_HOURS=18:00-07:00` in `.env` limits person alerts (while ON) to those hours.
+Free ntfy.sh limits: 15 MB per file, attachments kept for a few hours – save any clip you need to keep
+(the full recordings are always on the computer).
 
 ## 7. Tuning knobs
 
@@ -203,8 +219,9 @@ You get:
 | `MIN_SCORE` | 0.45 | how sure the detector must be that it's a person/vehicle |
 | `PLATE_MIN_SCORE` | 0.7 | how sure a plate read must be before deciding known/unknown |
 | `PLATE_ALERT_COOLDOWN` | 3600 | seconds before re-alerting the same unknown plate |
-| `PERSON_ALERT_HOURS` | always | `always` / `never` / `18:00-07:00` |
-| `PERSON_ALERT_COOLDOWN` | 300 | seconds between person alerts |
+| `PERSON_ALERT_HOURS` | always | while the button is ON: `always` or e.g. `18:00-07:00` |
+| `PERSON_ALERT_GAP` | 20 | min seconds between "person seen" alerts |
+| `SEND_CLIPS` | 1 | 0 = don't send video clips to the phone |
 | `ALPR_OCR_MODEL` | cct-s-v2-global-model | plate OCR model (global, recognises UK plates) |
 | `PLATES` | 1 | 0 = turn plate reading off |
 | `POSE` | 1 | 0 = turn body pose off (movement, loitering and zones still work) |

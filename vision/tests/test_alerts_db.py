@@ -34,3 +34,11 @@ def test_header_value_handles_newlines_and_unicode():
     enc = header_value("Sep 2020 – Feb 2021\nblue")
     assert enc.startswith("=?UTF-8?B?") and "\n" not in enc
     assert base64.b64decode(enc[10:-2]).decode() == "Sep 2020 – Feb 2021\\nblue"
+
+
+def test_switches_remembered(tmp_path):
+    from vision.alerts import Switches
+    s = Switches(str(tmp_path), {"person_alerts": True})
+    assert s.get("person_alerts")
+    s.set("person_alerts", False)
+    assert not Switches(str(tmp_path), {"person_alerts": True}).get("person_alerts")

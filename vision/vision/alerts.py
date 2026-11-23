@@ -65,15 +65,17 @@ class Notifier:
     def subscribe_url(self) -> str:
         return f"{self.phone_server}/{self.topic}"
 
-    def send(self, title: str, body: str, jpeg: bytes = b"", tags: str = "", priority: str = "high") -> bool:
+    def send(self, title: str, body: str, jpeg: bytes = b"", tags: str = "", priority: str = "high",
+             filename: str = "alert.jpg") -> bool:
+        """jpeg = optional attachment (a photo, or a video when filename ends in .mp4)."""
         headers = {"Title": header_value(title), "Priority": priority}
         if tags:
             headers["Tags"] = tags
         ok, err = True, ""
         try:
             if jpeg:
-                headers.update({"Message": header_value(body), "Filename": "alert.jpg"})
-                r = requests.put(self.url, data=jpeg, headers=headers, timeout=20)
+                headers.update({"Message": header_value(body), "Filename": filename})
+                r = requests.put(self.url, data=jpeg, headers=headers, timeout=20 + len(jpeg) / 100_000)
             else:
                 r = requests.post(self.url, data=body.encode(), headers=headers, timeout=10)
             r.raise_for_status()
@@ -93,3 +95,32 @@ class Notifier:
         buf = io.BytesIO()
         img.save(buf)
         return buf.getvalue().decode()
+
+
+class Switches:
+    """On/off switches set from the dashboard, remembered across restarts (data/switches.json)."""
+
+    def __init__(self, data_dir: str, defaults: dict):
+        import json
+        import threading
+        self._json, self.lock = json, threading.Lock()
+        self.path = Path(data_dir) / "switches.json"
+        self.values = dict(defaults)
+        try:
+            self.values.update({k: bool(v) for k, v in json.loads(self.path.read_text()).items() if k in defaults})
+        except (OSError, ValueError):
+            pass
+
+    def get(self, name: str) -> bool:
+        with self.lock:
+            return bool(self.values.get(name))
+
+    def set(self, name: str, value: bool) -> None:
+        with self.lock:
+            self.values[name] = bool(value)
+            try:
+                self.path.parent.mkdir(parents=True, exist_ok=True)
+                self.path.write_text(self._json.dumps(self.values))
+            except OSError:
+                log.exception("Could not save switches")
+        log.info("Switch %s → %s", name, "ON" if value else "OFF")

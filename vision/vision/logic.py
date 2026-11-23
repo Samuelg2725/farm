@@ -75,3 +75,46 @@ class LagMeter:
         if self.base is None or d < self.base:
             self.base = d
         return d - self.base
+
+
+class PersonAlerter:
+    """Decides when to send "person seen" alerts while person alerts are switched on.
+
+    A new person is announced `delay` seconds after they appear (so we can say what they're doing),
+    people arriving together share one alert, and alerts are at least `gap` seconds apart (later
+    arrivals wait and are included in the next one). Each behaviour of each person (running,
+    crouching…) alerts at most once per `behaviour_cooldown`.
+    """
+
+    def __init__(self, delay: float = 2.0, gap: float = 20.0, behaviour_cooldown: float = 60.0):
+        self.delay, self.gap, self.behaviour_cooldown = delay, gap, behaviour_cooldown
+        self.pending: dict[int, tuple[int, float]] = {}   # track id -> (person number, time seen)
+        self.last_sent = -1e18
+        self.behaviour_sent: dict[tuple[int, str], float] = {}
+
+    def arrived(self, tid: int, number: int, t: float) -> None:
+        self.pending.setdefault(tid, (number, t))
+
+    def is_pending(self, tid: int) -> bool:
+        return tid in self.pending
+
+    def due(self, t: float, present: set[int]) -> list[tuple[int, int]]:
+        """People to announce now: [(track id, number)]. People who already left are dropped."""
+        for tid in [k for k in self.pending if k not in present]:
+            del self.pending[tid]
+        ready = [(tid, n) for tid, (n, since) in self.pending.items() if t - since >= self.delay]
+        if not ready or t - self.last_sent < self.gap:
+            return []
+        out = [(tid, n) for tid, (n, _) in self.pending.items()]  # include anyone else waiting
+        self.pending.clear()
+        self.last_sent = t
+        return sorted(out, key=lambda x: x[1])
+
+    def behaviour_ok(self, number: int, behaviour: str, t: float) -> bool:
+        key = (number, behaviour)
+        if t - self.behaviour_sent.get(key, -1e18) < self.behaviour_cooldown:
+            return False
+        self.behaviour_sent[key] = t
+        if len(self.behaviour_sent) > 2000:
+            self.behaviour_sent.clear()
+        return True

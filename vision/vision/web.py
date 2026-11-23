@@ -27,8 +27,9 @@ class App:
     """Everything the web page needs to read."""
 
     def __init__(self, state: LiveState, db, notifier, recordings_dir: str, camera: str, keep_days: int,
-                 zone_store=None):
+                 zone_store=None, switches=None):
         self.state, self.db, self.notifier, self.zone_store = state, db, notifier, zone_store
+        self.switches = switches
         self.recordings_dir, self.camera, self.keep_days = Path(recordings_dir), camera, keep_days
 
 
@@ -73,7 +74,8 @@ class Handler(BaseHTTPRequestHandler):
             with a.state.lock:
                 body = {"camera": a.camera, "people": a.state.people, "vehicles": a.state.vehicles,
                         "stream_fps": round(a.state.stream_fps, 1), "lag": round(a.state.lag, 1),
-                        "recording": a.state.recording, "today": {k: v or 0 for k, v in counts.items()}}
+                        "recording": a.state.recording, "today": {k: v or 0 for k, v in counts.items()},
+                        "person_alerts": bool(a.switches and a.switches.get("person_alerts"))}
             return self._json(body)
         if url.path == "/api/events":
             kind = q.get("kind", "")
@@ -100,6 +102,15 @@ class Handler(BaseHTTPRequestHandler):
         return self._send(404, "text/plain", b"not found")
 
     def do_POST(self):
+        if urlparse(self.path).path == "/api/switch" and self.app.switches is not None:
+            try:
+                body = json.loads(self.rfile.read(min(int(self.headers.get("Content-Length", "0")), 1000)) or b"{}")
+                if body.get("name") != "person_alerts":
+                    raise ValueError("unknown switch")
+                self.app.switches.set("person_alerts", bool(body.get("on")))
+                return self._json({"person_alerts": self.app.switches.get("person_alerts")})
+            except Exception as e:
+                return self._send(400, "text/plain", str(e).encode())
         if urlparse(self.path).path == "/api/zones" and self.app.zone_store is not None:
             try:
                 n = int(self.headers.get("Content-Length", "0"))
@@ -223,6 +234,8 @@ dialog{background:var(--panel);color:var(--text);border:1px solid var(--line);bo
 dialog video{width:100%;display:block;background:#000;max-height:70vh}dialog .body{padding:12px 14px}
 dialog::backdrop{background:rgba(0,0,0,.7)}.x{float:right;background:none;border:0;color:var(--text);font-size:22px;cursor:pointer}
 .empty{color:var(--muted);padding:14px 0}
+.arm{border:0;border-radius:99px;padding:6px 14px;font:600 13px system-ui,sans-serif;cursor:pointer;background:#2a303b;color:var(--muted)}
+.arm.on{background:#16371f;color:#5ee38a;box-shadow:0 0 0 1px #2f8a4c inset}
 .doing{margin-top:4px;font-size:13px}.alarm{color:#fff;background:var(--bad);border-radius:4px;padding:1px 6px;font-size:12px;font-weight:600;margin-left:4px}
 .beh{color:var(--warn)}.beh.alert{color:var(--bad);font-weight:600}
 .zedit{display:flex;gap:16px;flex-wrap:wrap;align-items:flex-start}.zpic{position:relative;flex:1 1 560px;max-width:960px;cursor:crosshair}
@@ -233,7 +246,8 @@ dialog::backdrop{background:rgba(0,0,0,.7)}.x{float:right;background:none;border
 </style></head><body>
 <header><h1>🐄🐖🐔 Farm Security</h1>
 <span class="pill" id="cam">camera …</span><span class="pill" id="delay">delay …</span>
-<span class="pill rec" id="rec" hidden>● REC</span><span class="spacer"></span>
+<span class="pill rec" id="rec" hidden>● REC</span>
+<button id="arm" class="arm" title="Switch phone alerts for people on/off">🔔 Person alerts …</button><span class="spacer"></span>
 <span class="pill">Today: <b id="tp">0</b> people · <b id="tv">0</b> vehicles · <b id="tu" style="color:var(--bad)">0</b> unknown</span>
 </header>
 <main>
@@ -269,7 +283,8 @@ dialog::backdrop{background:rgba(0,0,0,.7)}.x{float:right;background:none;border
     <li>In the app tap <b>+</b>. Topic name: <code id="topic">…</code></li>
     <li id="serverstep">Leave <i>Use another server</i> unticked.</li>
     <li>Tap <b>Subscribe</b>, then press the button below – your phone should ping.</li>
-    <li class="small muted">Or scan the QR code with the phone camera.</li></ol>
+    <li class="small muted">Or scan the QR code with the phone camera.</li>
+    <li class="small muted">The <b>Person alerts</b> button at the top switches people alerts on/off (number-plate alerts always stay on).</li></ol>
    <div><button class="btn" id="testbtn">Send test alert</button><p id="testres" class="small"></p></div>
   </div><h3 style="font-size:14px;margin:18px 0 6px">Recent alerts</h3>
    <div class="tablewrap"><table><thead><tr><th>Time</th><th>Alert</th><th>Details</th><th>Delivered</th></tr></thead><tbody id="alertrows"></tbody></table></div>
@@ -290,7 +305,7 @@ async function j(u,o){const r=await fetch(u,o);return r.json()}
 
 async function status(){try{const s=await j('/api/status');
  $('#cam').innerHTML='camera <b>'+s.stream_fps+'</b> fps';$('#delay').innerHTML='delay <b>'+s.lag+'</b> s';
- $('#rec').hidden=!s.recording;$('#tp').textContent=s.today.people;$('#tv').textContent=s.today.vehicles;$('#tu').textContent=s.today.unknown;
+ $('#rec').hidden=!s.recording;setArm(s.person_alerts);$('#tp').textContent=s.today.people;$('#tv').textContent=s.today.vehicles;$('#tu').textContent=s.today.unknown;
  const cards=[...s.people.map(p=>`<div class="card"${(p.alerts||[]).length||(p.restricted||[]).length?' style="border-color:var(--bad)"':''}><div class="t"><span style="color:var(--person)">Person ${p.number}${(p.alerts||[]).map(a=>'<span class="alarm">'+esc(a)+'</span>').join('')}${(p.restricted||[]).map(z=>'<span class="alarm">in '+esc(z)+'</span>').join('')}</span><span>${pct(p.score)}</span></div>
   <div class="bar"><i style="width:${pct(p.score)}"></i></div>
   <div class="doing">${esc(p.doing||'')}${(p.zones||[]).length?' · <span class="muted">in '+(p.zones||[]).map(esc).join(', ')+'</span>':''}${p.seconds?' <span class="muted small">· '+p.seconds+'s in view</span>':''}</div></div>`),
@@ -352,6 +367,12 @@ $('#zundo').onclick=()=>{draft.pop();zdraw()};$('#zclear').onclick=()=>{draft=[]
 $('#zsave').onclick=()=>{const name=$('#zname').value.trim();if(draft.length<3){$('#zmsg').textContent='Click at least 3 corners on the picture first';return}
  if(!name){$('#zmsg').textContent='Give the zone a name';return}
  zput([...zoneList,{name,type:$('#ztype').value,hours:$('#zhours').value||'always',points:draft}],'Saved "'+name+'" – active straight away');draft=[];$('#zname').value='';};
+
+let armed=null;
+function setArm(on){armed=on;const b=$('#arm');b.classList.toggle('on',on);
+ b.textContent=on?'🔔 Person alerts ON':'🔕 Person alerts OFF';}
+$('#arm').onclick=async()=>{const want=!armed;if(!want&&!confirm('Turn person alerts OFF? People will still be logged and recorded, but your phone will not be pinged.'))return;
+ try{const r=await j('/api/switch',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:'person_alerts',on:want})});setArm(r.person_alerts);}catch(e){alert('Could not change alerts')}};
 
 const loaders={activity,vehicles,recordings,zones:()=>zones(false),alerts};let current='activity';
 document.querySelectorAll('.tabs button').forEach(b=>b.onclick=()=>{document.querySelectorAll('.tabs button,.tab').forEach(x=>x.classList.remove('on'));

@@ -35,3 +35,27 @@ def test_lag_meter():
     assert m.update(1.0, 101.0) == 0          # keeping up
     assert m.update(2.0, 103.5) == 1.5        # 1.5 s behind
     assert m.update(5.0, 104.8) == 0          # caught up (new baseline)
+
+
+def test_person_alerter_waits_groups_and_spaces_out():
+    from vision.logic import PersonAlerter
+    a = PersonAlerter(delay=2, gap=20)
+    a.arrived(10, 1, 0.0)
+    a.arrived(11, 2, 0.5)
+    assert a.due(1.0, {10, 11}) == []                 # wait to see what they're doing
+    assert a.due(2.0, {10, 11}) == [(10, 1), (11, 2)]  # one alert for both
+    a.arrived(12, 3, 5.0)
+    assert a.due(8.0, {12}) == []                      # too soon after the last alert
+    assert a.due(22.0, {12}) == [(12, 3)]              # sent once the gap has passed
+    a.arrived(13, 4, 30.0)
+    assert a.due(50.0, set()) == [] and not a.is_pending(13)   # left before we could alert: dropped
+
+
+def test_behaviour_cooldown():
+    from vision.logic import PersonAlerter
+    a = PersonAlerter(behaviour_cooldown=60)
+    assert a.behaviour_ok(1, "running", 0)
+    assert not a.behaviour_ok(1, "running", 30)
+    assert a.behaviour_ok(1, "crouching", 30)
+    assert a.behaviour_ok(2, "running", 30)
+    assert a.behaviour_ok(1, "running", 61)

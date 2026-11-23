@@ -43,6 +43,8 @@ services:
       TZ: ${TZ:-Europe/London}
       NTFY_BASE_URL: http://${HOST_IP:-localhost}:8080
       NTFY_ATTACHMENT_CACHE_DIR: /var/cache/ntfy/attachments
+      NTFY_ATTACHMENT_FILE_SIZE_LIMIT: 50M     # room for video clips
+      NTFY_ATTACHMENT_EXPIRY_DURATION: 24h
     volumes:
       - ./data/ntfy:/var/cache/ntfy
     ports:
@@ -62,14 +64,16 @@ services:
       NTFY_SERVER: ${NTFY_SERVER:-https://ntfy.sh}   # https://ntfy.sh = phones anywhere; http://ntfy = this computer only
       NTFY_TOPIC: ${NTFY_TOPIC:-}                     # blank = a private random topic is made for you
       NTFY_PUBLIC_URL: ${NTFY_PUBLIC_URL:-}           # only for http://ntfy: what phones use, e.g. http://10.1.0.50:8080
-      PERSON_ALERT_HOURS: ${PERSON_ALERT_HOURS:-always}   # always | never | 18:00-07:00
-      PERSON_ALERT_COOLDOWN: "300"     # seconds between person alerts
+      PERSON_ALERTS: "1"               # person alerts on at first start (then use the dashboard button)
+      PERSON_ALERT_HOURS: ${PERSON_ALERT_HOURS:-always}   # while ON, only alert in these hours, e.g. 18:00-07:00
+      PERSON_ALERT_GAP: "20"           # min seconds between "person seen" alerts (new arrivals are grouped)
+      SEND_CLIPS: "1"                  # after an alert, send the video clip (with boxes) to the phone
       PLATE_ALERT_COOLDOWN: "3600"     # don't re-alert the same unknown plate within an hour
       PLATE_MIN_SCORE: "0.7"           # how sure a plate read must be before deciding
       FPS: "5"                         # detections per second
       POSE: "1"                        # body pose → guess what people are doing
       LOITER_SECONDS: "120"            # "loitering" after this long in view
-      BEHAVIOUR_ALERTS: "lying down,climbing,restricted zone,loitering"   # which behaviours send phone alerts
+      BEHAVIOUR_ALERTS: "lying down,climbing,restricted zone,loitering"   # marked urgent (others still alert while ON)
       WHITELIST_PATH: /settings/whitelist.yaml
       DB_PATH: /data/vision.db
       RECORD: "1"                      # save 4K video while a person/vehicle is in view

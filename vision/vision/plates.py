@@ -35,16 +35,18 @@ class PlateReader:
         self.alpr = ALPR(detector_model=DETECTOR_MODEL, ocr_model=OCR_MODEL, detector_conf_thresh=0.3)
         log.info("Plate reader ready (%s / %s)", DETECTOR_MODEL, OCR_MODEL)
 
-    def read(self, image_bgr: np.ndarray) -> list[tuple[str, float, str, float]]:
-        """[(plate, confidence, country_guess, country_confidence)]"""
+    def read(self, image_bgr: np.ndarray) -> list[tuple]:
+        """[(plate, confidence, country_guess, country_confidence, (x1, y1, x2, y2) of the plate in the image)]"""
         out = []
         for r in self.alpr.predict(image_bgr):
             if not r.ocr or not r.ocr.text:
                 continue
             conf = r.ocr.confidence
             conf = float(np.mean(conf)) if isinstance(conf, (list, tuple, np.ndarray)) else float(conf)
+            bb = r.detection.bounding_box
             out.append((normalise(r.ocr.text), conf * float(r.detection.confidence) ** 0.5,
-                        getattr(r.ocr, "region", "") or "", float(getattr(r.ocr, "region_confidence", 0) or 0)))
+                        getattr(r.ocr, "region", "") or "", float(getattr(r.ocr, "region_confidence", 0) or 0),
+                        (int(bb.x1), int(bb.y1), int(bb.x2), int(bb.y2))))
         return out
 
 
@@ -77,6 +79,7 @@ class PlateInfo:
     grabs: int = 0
     last_grab: float = -1e18
     crop_jpeg: bytes = b""
+    photo_jpeg: bytes = b""          # vehicle + enlarged plate close-up, for the phone alert
     ocr_country: str = ""
     ocr_country_conf: float = 0.0
     colour: str = ""
@@ -116,7 +119,7 @@ class PlateBook:
         return True
 
     def add_read(self, tid: int, plate: str, score: float, now: float, crop_jpeg: bytes = b"",
-                 country: str = "", country_conf: float = 0.0) -> None:
+                 country: str = "", country_conf: float = 0.0, photo_jpeg: bytes = b"") -> None:
         p = self.get(tid, now)
         if p.decided or not plate:
             return
@@ -126,6 +129,8 @@ class PlateBook:
             p.ocr_country, p.ocr_country_conf = country, country_conf
             if crop_jpeg:
                 p.crop_jpeg = crop_jpeg
+            if photo_jpeg:
+                p.photo_jpeg = photo_jpeg
 
     def decide(self, tid: int, now: float, whitelist: list[Vehicle], lost: bool = False) -> PlateInfo | None:
         """Returns the PlateInfo if it was decided just now, else None."""

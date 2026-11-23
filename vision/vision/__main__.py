@@ -18,11 +18,12 @@ import cv2
 import numpy as np
 from norfair import Detection, Tracker
 
-from .alerts import Notifier
+from .alerts import Notifier, Switches
 from .behaviour import LABELS, BehaviourAnalyzer, CameraMotion
+from .clips import phone_clip, plate_photo
 from .db import DB
 from .detector import PERSON, VEHICLES, Detector
-from .logic import AlertPolicy, DailyNumbers, LagMeter
+from .logic import DailyNumbers, LagMeter, PersonAlerter, in_hours, parse_hours
 from .plateinfo import describe, estimate_colour
 from .plates import PlateBook, PlateReader, Whitelist, crop_scaled
 from .pose import SKELETON, PoseEstimator
@@ -42,8 +43,10 @@ DISPLAY_WIDTH = int(env("DISPLAY_WIDTH", "1920"))
 DISPLAY_FPS = float(env("DISPLAY_FPS", "12"))
 JPEG_QUALITY = int(env("JPEG_QUALITY", "85"))
 MAX_LAG = float(env("MAX_LAG", "2"))
-PERSON_ALERT_HOURS = env("PERSON_ALERT_HOURS", "always")
-PERSON_ALERT_COOLDOWN = float(env("PERSON_ALERT_COOLDOWN", "300"))
+PERSON_ALERTS = env("PERSON_ALERTS", "1") == "1"            # starting state of the dashboard on/off button
+PERSON_ALERT_HOURS = env("PERSON_ALERT_HOURS", "always")     # while switched on, only alert in these hours
+PERSON_ALERT_GAP = float(env("PERSON_ALERT_GAP", "20"))      # min seconds between "person seen" alerts
+PERSON_BEHAVIOUR_COOLDOWN = float(env("PERSON_BEHAVIOUR_COOLDOWN", "60"))  # same person + same behaviour
 PLATE_ALERT_COOLDOWN = float(env("PLATE_ALERT_COOLDOWN", "3600"))
 PLATE_MIN_SCORE = float(env("PLATE_MIN_SCORE", "0.7"))
 PLATES = env("PLATES", "1") == "1"
@@ -66,6 +69,9 @@ LOITER_SECONDS = float(env("LOITER_SECONDS", "120"))
 BEHAVIOUR_ALERTS = {b.strip() for b in env("BEHAVIOUR_ALERTS", "lying down,climbing,restricted zone,loitering").split(",")}
 BEHAVIOUR_ALERT_COOLDOWN = float(env("BEHAVIOUR_ALERT_COOLDOWN", "120"))
 ZONES_PATH = env("ZONES_PATH", "/settings/zones.yaml")
+SEND_CLIPS = env("SEND_CLIPS", "1") == "1"               # send the video to the phone after an alert
+CLIP_MAX_SECONDS = float(env("CLIP_MAX_SECONDS", "90"))
+CLIP_MAX_MB = float(env("CLIP_MAX_MB", "14"))            # ntfy.sh allows 15 MB per file
 GONE_AFTER = 5.0  # seconds out of view before a person/vehicle's log entry is finalised
 
 PERSON_COLOURS = [(0, 200, 255), (255, 120, 0), (200, 0, 255), (255, 255, 0), (255, 0, 160), (120, 255, 120)]
@@ -226,9 +232,11 @@ def plate_worker(jobs: queue.Queue, book: PlateBook, lock: threading.Lock) -> No
                 info = book.get(tid, time.time())
                 if colour and not info.colour:
                     info.colour = colour
-                for plate, score, country, country_conf in reads:
+                for plate, score, country, country_conf, box in reads:
                     log.info("Vehicle track %d: read %s (%.0f%%)", tid, plate, score * 100)
-                    book.add_read(tid, plate, score, time.time(), jpg.tobytes() if ok else b"", country, country_conf)
+                    better = score >= info.score
+                    book.add_read(tid, plate, score, time.time(), jpg.tobytes() if ok else b"", country, country_conf,
+                                  plate_photo(crop, box, plate) if better else b"")
         except Exception:
             log.exception("Plate reading failed")
 
@@ -238,6 +246,33 @@ def plate_fields(info) -> dict:
     return {"plate": info.plate, "plate_conf": round(info.score, 3) if info.plate else None,
             "country": d.get("country", ""), "plate_format": d.get("format", ""), "region": d.get("region", ""),
             "registered": d.get("registered", ""), "colour": info.colour, "status": info.status, "owner": info.owner}
+
+
+# ---------------------------------------------------------------- video to phone
+def send_clip(notifier: Notifier, db: DB, clip: str, seconds: float) -> None:
+    """After a recording that triggered an alert: send the video (with boxes) to the phone."""
+    from pathlib import Path
+    try:
+        src = Path(RECORDINGS_DIR) / clip
+        small = phone_clip(src, src.with_name(src.stem + "_phone.mp4"), CLIP_MAX_SECONDS, CLIP_MAX_MB)
+        if small is None:
+            return
+        rows = db.query("SELECT kind, number, label, plate, status FROM events WHERE clip = ? ORDER BY id", clip)
+        seen = []
+        for r in rows:
+            if r["kind"] == "person":
+                seen.append(f"Person {r['number']}")
+            elif r["kind"] == "vehicle":
+                seen.append(f"Vehicle {r['number']}" + (f" {r['plate']}" + (" UNKNOWN" if r["status"] == "unknown" else "")
+                                                         if r["plate"] else ""))
+            elif r["kind"] == "behaviour":
+                seen.append(f"Person {r['number']} {r['label']}")
+        cut = " (first %d s)" % CLIP_MAX_SECONDS if seconds > CLIP_MAX_SECONDS else ""
+        notifier.send(f"Video: {Path(clip).stem.replace('-', ':')} ({int(seconds)} s){cut}",
+                      ", ".join(dict.fromkeys(seen))[:600] or "Recording", small.read_bytes(),
+                      "movie_camera", priority="default", filename=Path(clip).stem + ".mp4")
+    except Exception:
+        log.exception("Could not send video clip")
 
 
 # ---------------------------------------------------------------- helpers
@@ -307,7 +342,9 @@ def main() -> None:
     people_tracker = Tracker(distance_function="iou", distance_threshold=0.75, initialization_delay=2, hit_counter_max=hit_max)
     vehicle_tracker = Tracker(distance_function="iou", distance_threshold=0.75, initialization_delay=2, hit_counter_max=hit_max)
     person_nums, vehicle_nums = DailyNumbers(), DailyNumbers()
-    person_policy = AlertPolicy(PERSON_ALERT_HOURS, PERSON_ALERT_COOLDOWN)
+    switches = Switches(DATA_DIR, {"person_alerts": PERSON_ALERTS})
+    alerter = PersonAlerter(delay=2.0, gap=PERSON_ALERT_GAP, behaviour_cooldown=PERSON_BEHAVIOUR_COOLDOWN)
+    alert_hours = parse_hours(PERSON_ALERT_HOURS)
     whitelist = Whitelist(WHITELIST_PATH)
     whitelist.get()
     book, book_lock = PlateBook(min_score=PLATE_MIN_SCORE), threading.Lock()
@@ -316,12 +353,13 @@ def main() -> None:
     recorder = Recorder(STREAM_URL, RECORDINGS_DIR, post_roll=RECORD_POST_ROLL, keep_days=RECORD_KEEP_DAYS,
                         keep_raw=RECORD_KEEP_RAW) if RECORD else None
     rec_row = None
+    clip_alerted = False   # was an alert sent during the current recording? then the video goes to the phone
     # open log rows for people/vehicles currently being tracked: track id -> {"id", "max", "seen"}
     people_rows: dict[int, dict] = {}
     vehicle_rows: dict[int, dict] = {}
 
     state = LiveState()
-    serve(App(state, db, notifier, RECORDINGS_DIR, CAMERA, RECORD_KEEP_DAYS, zone_store), PORT)
+    serve(App(state, db, notifier, RECORDINGS_DIR, CAMERA, RECORD_KEEP_DAYS, zone_store, switches), PORT)
     log.info("Dashboard on port %d", PORT)
     jobs: queue.Queue = queue.Queue(maxsize=8)
     if PLATES:
@@ -406,7 +444,11 @@ def main() -> None:
             change = recorder.update(now, bool(people or vehicles), thumb)
             if change and change[0] == "started":
                 rec_row = db.insert("recordings", start=stamp(now), **change[1])
-            elif change and change[0] == "stopped" and rec_row:
+                clip_alerted = False
+            elif change and change[0] == "stopped" and clip_alerted and SEND_CLIPS:
+                threading.Thread(target=send_clip, args=(notifier, db, change[1]["file"], change[1]["seconds"]),
+                                 daemon=True).start()
+            if change and change[0] == "stopped" and rec_row:
                 counts = db.query("SELECT SUM(kind='person') p, SUM(kind='vehicle') v, "
                                   "GROUP_CONCAT(DISTINCT plate) plates FROM events WHERE clip = ?", change[1]["file"])[0]
                 db.update("recordings", rec_row, end=stamp(now), people=counts["p"] or 0,
@@ -425,6 +467,7 @@ def main() -> None:
                                 number=p["number"], label="person", confidence=round(p["score"], 3), clip=clip)
                 people_rows[p["tid"]] = {"id": rid, "max": p["score"], "seen": ts}
                 new_people.append(p["number"])
+                alerter.arrived(p["tid"], p["number"], ts)
                 log.info("New person: Person %d (%.0f%%)", p["number"], p["score"] * 100)
             else:
                 row["seen"], row["max"] = ts, max(row["max"], p["score"])
@@ -464,7 +507,9 @@ def main() -> None:
                     fields["registered"] and f"plate issued {fields['registered']}", fields["colour"]]))
                 notifier.send(f"UNKNOWN VEHICLE: {info.plate}",
                               f"Vehicle {num} on {CAMERA} - plate {info.score:.0%} sure - {now:%d %b %H:%M:%S}"
-                              + (f"\n{extra}" if extra else ""), info.crop_jpeg, "rotating_light")
+                              + (f"\n{extra}" if extra else "") + ("\nVideo follows when the clip ends." if clip and SEND_CLIPS else ""),
+                              info.photo_jpeg or info.crop_jpeg, "rotating_light")
+                clip_alerted = True
 
         # people / vehicles out of view for a while → finalise their log rows
         for rows in (people_rows, vehicle_rows):
@@ -479,15 +524,17 @@ def main() -> None:
                 db.update("events", r["id"], confidence=round(r["max"], 3),
                           last_seen=stamp(datetime.fromtimestamp(r["seen"])))
 
-        # ---- behaviours: log each one, add to the person's row, alert on the serious ones
+        # ---- behaviours: log each one and add to the person's row
+        alerts_on = switches.get("person_alerts") and in_hours(alert_hours, now.time())
+        behaviour_alerts = []
         for p, b in behaviour_events:
             zone = next((z for z in zones if b == f"entered {z.name}"), None)
             label = LABELS.get(b, b)
             row = people_rows.get(p["tid"])
+            serious = (zone is not None and zone.kind == "restricted") or b in ("lying down", "climbing")
             db.insert("events", ts=stamp(now), last_seen=stamp(now), camera=CAMERA, kind="behaviour",
                       number=p["number"], label=label, confidence=round(p["score"], 3), clip=clip,
-                      details=(f"{zone.kind} zone" if zone else p.get("doing", "")),
-                      status=("alert" if (zone and zone.kind == "restricted") or b in ("lying down", "climbing") else ""))
+                      details=(f"{zone.kind} zone" if zone else p.get("doing", "")), status="alert" if serious else "")
             if row is not None:
                 row.setdefault("actions", [])
                 if label not in row["actions"]:
@@ -495,28 +542,47 @@ def main() -> None:
                     db.update("events", row["id"], actions=", ".join(row["actions"]))
             log.info("Person %d: %s", p["number"], label)
             kind = "restricted zone" if zone and zone.kind == "restricted" else b
-            if kind in BEHAVIOUR_ALERTS:
-                # safety alerts are per person; loitering / zone alerts once per cooldown (no spam for groups)
-                key = f"{kind}:{p['number']}" if kind in ("lying down", "climbing") else f"{kind}:{b}"
-                if ts - last_behaviour_alert.get(key, -1e18) >= BEHAVIOUR_ALERT_COOLDOWN:
-                    last_behaviour_alert[key] = ts
-                    title = {"lying down": f"Possible fall: Person {p['number']} lying down",
-                             "climbing": f"Person {p['number']} climbing",
-                             "loitering": f"Loitering: Person {p['number']} in view for {duration(p.get('seconds', 0))}",
-                             }.get(kind, f"Person {p['number']} entered {zone.name if zone else ''}".strip())
-                    ok, b2 = cv2.imencode(".jpg", draw(frame, people, vehicles, zones=state.zones),
-                                          [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
-                    notifier.send(title, f"{CAMERA} - {p['score']:.0%} sure it's a person - {now:%d %b %H:%M:%S}",
-                                  b2.tobytes() if ok else b"", "warning")
+            if zone is not None and zone.kind != "restricted":
+                continue  # watch zones are log-only
+            # alert on it (switch on) – unless their "person seen" alert is about to go out and will say it anyway
+            if alerts_on and (kind in BEHAVIOUR_ALERTS or not alerter.is_pending(p["tid"])) \
+                    and alerter.behaviour_ok(p["number"], b, ts):
+                behaviour_alerts.append((p, label, serious))
 
-        # person alert
-        if new_people and person_policy.should_alert(now):
-            ok, b = cv2.imencode(".jpg", draw(frame, people, vehicles, zones=state.zones),
-                                 [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
-            best = max(p["score"] for p in people if p["number"] in new_people)
-            notifier.send(f"Person seen: {', '.join(f'Person {n}' for n in new_people)}",
-                          f"{CAMERA} - {len(people)} people in view - {best:.0%} sure - {now:%d %b %H:%M:%S}",
-                          b.tobytes() if ok else b"", "bust_in_silhouette")
+        def photo() -> bytes:
+            ok, buf = cv2.imencode(".jpg", draw(frame, people, vehicles, zones=state.zones),
+                                   [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
+            return buf.tobytes() if ok else b""
+
+        def describe_person(p) -> str:
+            extra = [p.get("doing") or ""] + [f"in {z}" for z in p.get("zones", [])]
+            return f"Person {p['number']}: " + (", ".join(e for e in extra if e) or "seen") + f" ({p['score']:.0%} sure)"
+
+        if behaviour_alerts:
+            serious = any(s_ for _, _, s_ in behaviour_alerts)
+            title = " · ".join(f"Person {p['number']} {lab}" for p, lab, _ in behaviour_alerts)
+            if serious:
+                title = "⚠ " + title
+            clip_alerted = True
+            notifier.send(title, "\n".join(describe_person(p) for p in people if p.get("fresh"))
+                          + f"\n{CAMERA} - {now:%d %b %H:%M:%S}", photo(), "warning" if serious else "bust_in_silhouette",
+                          priority="urgent" if serious else "high")
+
+        # ---- "person seen" alert: everyone who has turned up, with what they're doing and the boxed photo
+        due = alerter.due(ts, {p["tid"] for p in people})
+        if due and alerts_on:
+            by_tid = {p["tid"]: p for p in people}
+            who = [by_tid[tid] for tid, _ in due if tid in by_tid]
+            if who:
+                if len(who) == 1:
+                    title = f"Person seen: Person {who[0]['number']}" + (f" - {who[0]['doing']}" if who[0].get("doing") else "")
+                else:
+                    title = f"{len(who)} people seen: " + ", ".join(f"Person {p['number']}" for p in who)
+                body = "\n".join(describe_person(p) for p in who)
+                clip_alerted = True
+                notifier.send(title, body + f"\n{len(people)} in view on {CAMERA} - {now:%d %b %H:%M:%S}"
+                              + ("\nVideo follows when the clip ends." if clip and SEND_CLIPS else ""),
+                              photo(), "bust_in_silhouette")
 
         time.sleep(max(0.0, period - (time.time() - t0)))
 
