@@ -29,19 +29,6 @@ def crop_scaled(frame: np.ndarray, box, src_size: tuple[int, int], pad: float = 
     return frame[y1:y2, x1:x2]
 
 
-def grab_frame(url: str, tries: int = 30) -> np.ndarray | None:
-    """Open an RTSP stream, return one decoded full-resolution frame."""
-    cap = cv2.VideoCapture(url, cv2.CAP_FFMPEG)
-    try:
-        for _ in range(tries):
-            ok, frame = cap.read()
-            if ok and frame is not None:
-                return frame
-        return None
-    finally:
-        cap.release()
-
-
 class PlateReader:
     def __init__(self):
         from fast_alpr import ALPR  # heavy import

@@ -56,14 +56,15 @@ services:
     environment:
       TZ: ${TZ:-Europe/London}
       CAMERA: yard_ptz
-      STREAM_URL: rtsp://frigate:8554/yard_ptz_sub   # low-res: people + vehicle detection
-      MAIN_URL: rtsp://frigate:8554/yard_ptz         # 4K: number plate reading
+      STREAM_URL: rtsp://frigate:8554/yard_ptz   # 4K main stream: live view, detection and plates
+      DISPLAY_WIDTH: "1920"            # live view size: 1920 = 1080p, 2560 = 1440p, 3840 = full 4K
+      DISPLAY_FPS: "12"                # live view refresh rate
       NTFY_URL: http://ntfy/${NTFY_TOPIC:-farm-alerts}
       PERSON_ALERT_HOURS: ${PERSON_ALERT_HOURS:-always}   # always | never | 18:00-07:00
       PERSON_ALERT_COOLDOWN: "300"     # seconds between person alerts
       PLATE_ALERT_COOLDOWN: "3600"     # don't re-alert the same unknown plate within an hour
       PLATE_MIN_SCORE: "0.7"           # how sure a plate read must be before deciding
-      FPS: "5"
+      FPS: "5"                         # detections per second
       WHITELIST_PATH: /settings/whitelist.yaml
       DB_PATH: /data/vision.db
     volumes:

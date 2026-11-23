@@ -9,5 +9,7 @@ ADD --checksum=sha256:c5c2d13e59ae883e6af3b45daea64af4833a4951c92d116ec270d9ddbe
 COPY vision ./vision
 # Download the plate models at build time so it works offline afterwards
 RUN python -c "from vision.plates import PlateReader; PlateReader()"
+# Use TCP for camera video: UDP drops packets → smeared/blurry frames
+ENV OPENCV_FFMPEG_CAPTURE_OPTIONS="rtsp_transport;tcp"
 EXPOSE 8090
 CMD ["python", "-u", "-m", "vision"]

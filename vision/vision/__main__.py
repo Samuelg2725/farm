@@ -1,8 +1,9 @@
 """Farm vision: people tracking + vehicle number plate checks, at the same time, on one live view.
 
-Low-res camera stream → YOLOX finds people AND vehicles in one pass → Norfair follows each one
+4K camera stream → YOLOX finds people AND vehicles in one pass → Norfair follows each one
 → people get boxes "Person 1, 2, 3…"; vehicles get boxes "Vehicle 1" + plate + KNOWN/UNKNOWN
-(plates are read from a full-res 4K frame cropped round the vehicle, using FastALPR).
+(plates are read by FastALPR from the same 4K frame, cropped round the vehicle).
+The live view is the full-quality picture scaled to 1080p, refreshed faster than detection runs.
 Live view: http://<host>:8090   Alerts: ntfy.
 """
 from __future__ import annotations
@@ -24,13 +25,15 @@ from norfair import Detection, Tracker
 
 from .detector import PERSON, VEHICLES, Detector
 from .logic import AlertPolicy, DailyNumbers
-from .plates import PlateBook, PlateReader, Whitelist, crop_scaled, grab_frame
+from .plates import PlateBook, PlateReader, Whitelist, crop_scaled
 
 log = logging.getLogger("vision")
 
 CAMERA = os.getenv("CAMERA", "yard_ptz")
-STREAM_URL = os.getenv("STREAM_URL", "rtsp://frigate:8554/yard_ptz_sub")  # low-res, for detection
-MAIN_URL = os.getenv("MAIN_URL", "rtsp://frigate:8554/yard_ptz")          # 4K, for plates
+STREAM_URL = os.getenv("STREAM_URL", "rtsp://frigate:8554/yard_ptz")  # 4K main stream
+DISPLAY_WIDTH = int(os.getenv("DISPLAY_WIDTH", "1920"))     # live view size (1920 = 1080p)
+DISPLAY_FPS = float(os.getenv("DISPLAY_FPS", "12"))         # live view refresh rate
+JPEG_QUALITY = int(os.getenv("JPEG_QUALITY", "85"))
 MODEL_PATH = os.getenv("MODEL_PATH", "/models/yolox_s.onnx")
 FPS = float(os.getenv("FPS", "5"))
 MIN_SCORE = float(os.getenv("MIN_SCORE", "0.45"))
@@ -55,6 +58,7 @@ class FrameGrabber(threading.Thread):
     def __init__(self, url: str):
         super().__init__(daemon=True)
         self.url, self.frame, self.lock = url, None, threading.Lock()
+        self.frames, self.fps, self.seq = 0, 0.0, 0
 
     def run(self):
         while True:
@@ -63,7 +67,9 @@ class FrameGrabber(threading.Thread):
                 log.warning("Cannot open %s – retrying in 5 s", self.url)
                 time.sleep(5)
                 continue
-            log.info("Connected to stream %s", self.url)
+            log.info("Connected to stream %s (%dx%d)", self.url,
+                     int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)))
+            t_count, n = time.time(), 0
             while True:
                 ok, frame = cap.read()
                 if not ok:
@@ -71,12 +77,17 @@ class FrameGrabber(threading.Thread):
                     break
                 with self.lock:
                     self.frame = frame
+                    self.seq += 1
+                n += 1
+                if time.time() - t_count >= 10:
+                    self.fps, t_count, n = n / (time.time() - t_count), time.time(), 0
             cap.release()
             time.sleep(2)
 
     def latest(self):
+        """Newest frame (read-only – never drawn on) and its sequence number."""
         with self.lock:
-            return None if self.frame is None else self.frame.copy()
+            return self.frame, self.seq
 
 
 # ---------------------------------------------------------------- drawing
@@ -87,10 +98,11 @@ def _label(frame, text, x, y, colour, scale):
     cv2.putText(frame, text, (x + 3, ty - 4), cv2.FONT_HERSHEY_SIMPLEX, 0.6 * scale, (0, 0, 0), 2)
 
 
-def draw(frame: np.ndarray, people: list[dict], vehicles: list[dict]) -> np.ndarray:
-    f = 720 / frame.shape[0] if frame.shape[0] < 720 else 1.0  # upscale low-res stream so labels are readable
-    if f != 1.0:
-        frame = cv2.resize(frame, None, fx=f, fy=f, interpolation=cv2.INTER_LINEAR)
+def draw(frame: np.ndarray, people: list[dict], vehicles: list[dict], width: int = DISPLAY_WIDTH) -> np.ndarray:
+    """Returns a NEW image `width` wide with boxes drawn (boxes are in `frame` pixels)."""
+    f = width / frame.shape[1]
+    interp = cv2.INTER_AREA if f < 1 else cv2.INTER_LINEAR  # INTER_AREA keeps downscaled 4K sharp
+    frame = cv2.resize(frame, (width, int(round(frame.shape[0] * f))), interpolation=interp)
     scale = frame.shape[0] / 720
     thick = max(2, int(2 * scale))
     for v in vehicles:
@@ -134,6 +146,24 @@ class State:
         self.jpeg: bytes = b""
         self.people: list[dict] = []
         self.vehicles: list[dict] = []
+        self.stream_fps = 0.0
+
+
+def render_loop(grabber: "FrameGrabber") -> None:
+    """Draws the latest boxes on the newest camera frame for a smooth, sharp live view."""
+    period, last_seq = 1.0 / DISPLAY_FPS, -1
+    while True:
+        t0 = time.time()
+        frame, seq = grabber.latest()
+        if frame is not None and seq != last_seq:
+            last_seq = seq
+            with STATE.lock:
+                people, vehicles = STATE.people, STATE.vehicles
+            ok, buf = cv2.imencode(".jpg", draw(frame, people, vehicles), [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
+            if ok:
+                with STATE.lock:
+                    STATE.jpeg, STATE.stream_fps = buf.tobytes(), grabber.fps
+        time.sleep(max(0.0, period - (time.time() - t0)))
 
 
 STATE = State()
@@ -141,7 +171,7 @@ STATE = State()
 PAGE = """<!doctype html><html><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1"><title>Farm Live View</title>
 <style>body{margin:0;background:#111;color:#eee;font-family:system-ui,sans-serif}
-header{padding:10px 16px;font-size:18px}img{width:100%;max-width:1280px;display:block;margin:auto}
+header{padding:10px 16px;font-size:18px}img{width:100%;max-width:1920px;display:block;margin:auto}
 .row{padding:6px 16px;font-size:15px}.unknown{color:#ff5a5a;font-weight:bold}.known{color:#5ad15a}</style></head><body>
 <header>Farm live view – <span id="count">…</span></header>
 <img src="/stream.mjpg" alt="live view"><div class="row" id="people"></div><div class="row" id="vehicles"></div>
@@ -164,7 +194,8 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, "text/html; charset=utf-8", PAGE.encode())
         elif self.path == "/status.json":
             with STATE.lock:
-                body = json.dumps({"camera": CAMERA, "people": STATE.people, "vehicles": STATE.vehicles})
+                body = json.dumps({"camera": CAMERA, "people": STATE.people, "vehicles": STATE.vehicles,
+                                   "stream_fps": round(STATE.stream_fps, 1)})
             self._send(200, "application/json", body.encode())
         elif self.path == "/snapshot.jpg":
             with STATE.lock:
@@ -202,15 +233,8 @@ class Handler(BaseHTTPRequestHandler):
 def plate_worker(jobs: queue.Queue, book: PlateBook, lock: threading.Lock) -> None:
     reader = PlateReader()
     while True:
-        tid, box, src_size = jobs.get()
+        tid, crop = jobs.get()
         try:
-            frame = grab_frame(MAIN_URL)
-            if frame is None:
-                log.warning("Could not grab 4K frame from %s", MAIN_URL)
-                continue
-            crop = crop_scaled(frame, box, src_size)
-            if crop.size == 0:
-                continue
             ok, jpg = cv2.imencode(".jpg", crop, [cv2.IMWRITE_JPEG_QUALITY, 85])
             for plate, score in reader.read(crop):
                 log.info("Vehicle track %d: read %s (%.2f)", tid, plate, score)
@@ -260,17 +284,20 @@ def main() -> None:
         threading.Thread(target=plate_worker, args=(jobs, book, book_lock), daemon=True).start()
     grabber = FrameGrabber(STREAM_URL)
     grabber.start()
+    threading.Thread(target=render_loop, args=(grabber,), daemon=True).start()
     threading.Thread(target=ThreadingHTTPServer(("0.0.0.0", PORT), Handler).serve_forever, daemon=True).start()
     log.info("Live view on port %d", PORT)
 
-    period = 1.0 / FPS
+    period, last_log = 1.0 / FPS, 0.0
     while True:
         t0 = time.time()
-        frame = grabber.latest()
+        frame, _ = grabber.latest()
         if frame is None:
             time.sleep(0.5)
             continue
-        src_size = (frame.shape[1], frame.shape[0])
+        if t0 - last_log > 60:
+            last_log = t0
+            log.info("Stream %dx%d at %.1f fps", frame.shape[1], frame.shape[0], grabber.fps)
         dets = detector.detect(frame)
         now, ts = datetime.now(), time.time()
 
@@ -291,11 +318,10 @@ def main() -> None:
             for t, box, score in vtracks:
                 seen.add(t.id)
                 num, _ = vehicle_nums.number_for(t.id, now)
-                if OWN_ALPR and book.want_grab(t.id, ts):
-                    try:
-                        jobs.put_nowait((t.id, box, src_size))
-                    except queue.Full:
-                        pass
+                if OWN_ALPR and not jobs.full() and book.want_grab(t.id, ts):
+                    crop = crop_scaled(frame, box, (frame.shape[1], frame.shape[0])).copy()
+                    if crop.size:
+                        jobs.put_nowait((t.id, crop))
                 info = book.get(t.id, ts)
                 if book.decide(t.id, ts, wl):
                     decided.append((num, info))
@@ -307,12 +333,12 @@ def main() -> None:
                     decided.append((vehicle_nums.map.get(tid, 0), info))
                 book.forget(tid)
 
-        annotated = draw(frame, people, vehicles)
-        ok, buf = cv2.imencode(".jpg", annotated, [cv2.IMWRITE_JPEG_QUALITY, 80])
-        jpeg = buf.tobytes() if ok else b""
         with STATE.lock:
-            STATE.jpeg = jpeg or STATE.jpeg
             STATE.people, STATE.vehicles = people, vehicles
+        jpeg = b""
+        if new_people or decided:  # picture for alerts
+            ok, buf = cv2.imencode(".jpg", draw(frame, people, vehicles), [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
+            jpeg = buf.tobytes() if ok else b""
 
         # ---- logging + alerts
         stamp = now.isoformat(timespec="seconds")

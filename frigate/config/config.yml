@@ -57,6 +57,11 @@ cameras:
         - path: rtsp://127.0.0.1:8554/yard_ptz_sub
           input_args: preset-rtsp-restream
           roles: [detect]
+    # Live view in Frigate: pick "Main (4K)" in the stream menu for full quality
+    live:
+      streams:
+        Main (4K): yard_ptz
+        Sub (fast): yard_ptz_sub
     detect:
       enabled: true
       width: 640      # set to your sub stream resolution

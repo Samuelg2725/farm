@@ -17,12 +17,12 @@ Everything is **free and open source**, and runs on site with no cloud and no su
 How it works, every frame (5 per second):
 
 ```
-camera low-res stream ─► YOLOX finds people + vehicles ─► Norfair tracks them
-      │                                                     │
+camera 4K stream ─► YOLOX finds people + vehicles ─► Norfair tracks them
       │                         people ──► "Person 1, 2, 3…" boxes  ──► person alert
       │                         vehicles ─► "Vehicle 1" box
-camera 4K stream ─► crop round each vehicle ─► FastALPR reads plate ─► whitelist check
-                                                    ─► green "OK owner"  or  red "UNKNOWN!" + alert
+      │                              └─► 4K crop ─► FastALPR reads plate ─► whitelist check
+      │                                   ─► green "OK owner"  or  red "UNKNOWN!" + alert
+      └─► live view: full-quality picture at 1080p with all the boxes drawn on
 ```
 
 ---
@@ -158,7 +158,9 @@ Phones get alerts while on the site network. For alerts when away, use a free op
 
 | Setting | Default | Meaning |
 |---|---|---|
-| `FPS` | 5 | frames per second analysed – lower if the computer struggles |
+| `FPS` | 5 | detections per second – lower if the computer struggles |
+| `DISPLAY_WIDTH` | 1920 | live view size: 1920 (1080p), 2560 (1440p), 3840 (full 4K) |
+| `DISPLAY_FPS` | 12 | live view refresh rate |
 | `MIN_SCORE` | 0.45 | how sure the detector must be that it's a person/vehicle |
 | `PLATE_MIN_SCORE` | 0.7 | how sure a plate read must be before deciding known/unknown |
 | `PLATE_ALERT_COOLDOWN` | 3600 | seconds before re-alerting the same unknown plate |
@@ -203,4 +205,5 @@ model:
 | Plates never read | plate too small – zoom in so it's ~150 px wide in the 4K image; check `docker logs vision` for `read` lines |
 | No phone alert | `docker logs vision`; check the ntfy app server address + topic match `.env` |
 | "Cannot open" / "Could not grab" in vision logs | Frigate not running yet – `docker compose ps`; it retries automatically |
-| Live view slow / Mac hot | lower `FPS` to 2–3 |
+| Live view slow / lagging behind / Mac hot | lower `FPS` to 3 and `DISPLAY_FPS` to 8; in the Reolink app set the main stream to 15 fps. `docker logs vision` shows "Stream 3840x2160 at N fps" – N should be close to the camera's frame rate |
+| Frigate live view blurry | click the camera → stream menu → choose **Main (4K)** |
