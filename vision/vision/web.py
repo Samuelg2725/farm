@@ -208,7 +208,7 @@ dialog video{width:100%;display:block;background:#000;max-height:70vh}dialog .bo
 dialog::backdrop{background:rgba(0,0,0,.7)}.x{float:right;background:none;border:0;color:var(--text);font-size:22px;cursor:pointer}
 .empty{color:var(--muted);padding:14px 0}
 </style></head><body>
-<header><h1>🐄 Farm Security</h1>
+<header><h1>🐄🐖🐔 Farm Security</h1>
 <span class="pill" id="cam">camera …</span><span class="pill" id="delay">delay …</span>
 <span class="pill rec" id="rec" hidden>● REC</span><span class="spacer"></span>
 <span class="pill">Today: <b id="tp">0</b> people · <b id="tv">0</b> vehicles · <b id="tu" style="color:var(--bad)">0</b> unknown</span>
