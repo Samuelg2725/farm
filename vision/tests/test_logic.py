@@ -26,3 +26,12 @@ def test_alert_cooldown_and_hours():
     assert p.should_alert(datetime(2026, 11, 23, 22, 0, 0))
     assert not p.should_alert(datetime(2026, 11, 23, 22, 2, 0))
     assert p.should_alert(datetime(2026, 11, 23, 22, 6, 0))
+
+
+def test_lag_meter():
+    from vision.logic import LagMeter
+    m = LagMeter()
+    assert m.update(0.0, 100.0) == 0
+    assert m.update(1.0, 101.0) == 0          # keeping up
+    assert m.update(2.0, 103.5) == 1.5        # 1.5 s behind
+    assert m.update(5.0, 104.8) == 0          # caught up (new baseline)

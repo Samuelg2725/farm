@@ -55,3 +55,23 @@ class AlertPolicy:
             return False
         self.last = ts
         return True
+
+
+class LagMeter:
+    """Estimates how far behind live we are from stream timestamps.
+
+    For a live stream, (wall clock - stream timestamp) stays constant when we keep up.
+    If decoding is too slow, frames queue up and that difference grows: that growth is our lag.
+    """
+
+    def __init__(self):
+        self.base: float | None = None
+
+    def reset(self) -> None:
+        self.base = None
+
+    def update(self, pts: float, wall: float) -> float:
+        d = wall - pts
+        if self.base is None or d < self.base:
+            self.base = d
+        return d - self.base

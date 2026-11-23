@@ -24,7 +24,7 @@ import requests
 from norfair import Detection, Tracker
 
 from .detector import PERSON, VEHICLES, Detector
-from .logic import AlertPolicy, DailyNumbers
+from .logic import AlertPolicy, DailyNumbers, LagMeter
 from .plates import PlateBook, PlateReader, Whitelist, crop_scaled
 
 log = logging.getLogger("vision")
@@ -34,6 +34,7 @@ STREAM_URL = os.getenv("STREAM_URL", "rtsp://frigate:8554/yard_ptz")  # 4K main 
 DISPLAY_WIDTH = int(os.getenv("DISPLAY_WIDTH", "1920"))     # live view size (1920 = 1080p)
 DISPLAY_FPS = float(os.getenv("DISPLAY_FPS", "12"))         # live view refresh rate
 JPEG_QUALITY = int(os.getenv("JPEG_QUALITY", "85"))
+MAX_LAG = float(os.getenv("MAX_LAG", "2"))  # seconds behind live before we skip ahead (reconnect)
 MODEL_PATH = os.getenv("MODEL_PATH", "/models/yolox_s.onnx")
 FPS = float(os.getenv("FPS", "5"))
 MIN_SCORE = float(os.getenv("MIN_SCORE", "0.45"))
@@ -58,7 +59,7 @@ class FrameGrabber(threading.Thread):
     def __init__(self, url: str):
         super().__init__(daemon=True)
         self.url, self.frame, self.lock = url, None, threading.Lock()
-        self.frames, self.fps, self.seq = 0, 0.0, 0
+        self.frames, self.fps, self.seq, self.lag, self.skips = 0, 0.0, 0, 0.0, 0
 
     def run(self):
         while True:
@@ -69,18 +70,28 @@ class FrameGrabber(threading.Thread):
                 continue
             log.info("Connected to stream %s (%dx%d)", self.url,
                      int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)), int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)))
-            t_count, n = time.time(), 0
+            t_count, n, meter = time.time(), 0, LagMeter()
             while True:
                 ok, frame = cap.read()
                 if not ok:
                     log.warning("Stream dropped – reconnecting")
                     break
+                now = time.time()
                 with self.lock:
                     self.frame = frame
                     self.seq += 1
+                pts = cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0
+                if pts > 0:
+                    self.lag = meter.update(pts, now)
+                    if self.lag > MAX_LAG:
+                        self.skips += 1
+                        log.warning("Fell %.1f s behind live (decoding %.1f fps) – skipping ahead. "
+                                    "If this repeats, lower the camera's frame rate.", self.lag, self.fps)
+                        self.lag = 0.0
+                        break
                 n += 1
-                if time.time() - t_count >= 10:
-                    self.fps, t_count, n = n / (time.time() - t_count), time.time(), 0
+                if now - t_count >= 10:
+                    self.fps, t_count, n = n / (now - t_count), now, 0
             cap.release()
             time.sleep(2)
 
@@ -147,6 +158,7 @@ class State:
         self.people: list[dict] = []
         self.vehicles: list[dict] = []
         self.stream_fps = 0.0
+        self.lag = 0.0
 
 
 def render_loop(grabber: "FrameGrabber") -> None:
@@ -162,7 +174,7 @@ def render_loop(grabber: "FrameGrabber") -> None:
             ok, buf = cv2.imencode(".jpg", draw(frame, people, vehicles), [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
             if ok:
                 with STATE.lock:
-                    STATE.jpeg, STATE.stream_fps = buf.tobytes(), grabber.fps
+                    STATE.jpeg, STATE.stream_fps, STATE.lag = buf.tobytes(), grabber.fps, grabber.lag
         time.sleep(max(0.0, period - (time.time() - t0)))
 
 
@@ -173,11 +185,12 @@ PAGE = """<!doctype html><html><head><meta charset="utf-8">
 <style>body{margin:0;background:#111;color:#eee;font-family:system-ui,sans-serif}
 header{padding:10px 16px;font-size:18px}img{width:100%;max-width:1920px;display:block;margin:auto}
 .row{padding:6px 16px;font-size:15px}.unknown{color:#ff5a5a;font-weight:bold}.known{color:#5ad15a}</style></head><body>
-<header>Farm live view – <span id="count">…</span></header>
+<header>Farm live view – <span id="count">…</span> <small id="health" style="color:#999"></small></header>
 <img src="/stream.mjpg" alt="live view"><div class="row" id="people"></div><div class="row" id="vehicles"></div>
 <script>
 async function tick(){try{const s=await (await fetch('/status.json')).json();
 document.getElementById('count').textContent=s.people.length+' people, '+s.vehicles.length+' vehicles';
+document.getElementById('health').textContent='· camera '+s.stream_fps+' fps · delay '+s.lag+' s';
 document.getElementById('people').textContent='People: '+(s.people.map(p=>'Person '+p.number).join(' - ')||'none');
 document.getElementById('vehicles').innerHTML='Vehicles: '+(s.vehicles.map(v=>'<span class="'+v.status+'">Vehicle '+v.number+
  (v.plate?' '+v.plate:'')+' ('+v.status+(v.owner?' – '+v.owner:'')+')</span>').join(' - ')||'none');}catch(e){}}
@@ -195,7 +208,7 @@ class Handler(BaseHTTPRequestHandler):
         elif self.path == "/status.json":
             with STATE.lock:
                 body = json.dumps({"camera": CAMERA, "people": STATE.people, "vehicles": STATE.vehicles,
-                                   "stream_fps": round(STATE.stream_fps, 1)})
+                                   "stream_fps": round(STATE.stream_fps, 1), "lag": round(STATE.lag, 1)})
             self._send(200, "application/json", body.encode())
         elif self.path == "/snapshot.jpg":
             with STATE.lock:
@@ -297,7 +310,8 @@ def main() -> None:
             continue
         if t0 - last_log > 60:
             last_log = t0
-            log.info("Stream %dx%d at %.1f fps", frame.shape[1], frame.shape[0], grabber.fps)
+            log.info("Stream %dx%d at %.1f fps, %.1f s behind live, %d skips", frame.shape[1], frame.shape[0],
+                     grabber.fps, grabber.lag, grabber.skips)
         dets = detector.detect(frame)
         now, ts = datetime.now(), time.time()
 

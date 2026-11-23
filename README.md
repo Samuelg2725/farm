@@ -141,10 +141,21 @@ Spaces/case don't matter. One misread character (e.g. B read as 8) still counts 
 
 ## 6. Alerts on your phone (ntfy – free, open source)
 
-1. Set `HOST_IP` (this computer's IP) and `NTFY_TOPIC` (any hard-to-guess name) in `.env`, then `docker compose up -d`.
-2. Install the **ntfy** app (Android Play Store / F-Droid, or iPhone App Store).
-3. In the app: **+** → *Use another server* → `http://HOST_IP:8080` → topic = your `NTFY_TOPIC`.
-4. Test: `curl -d "test alert" http://HOST_IP:8080/farm-alerts` – your phone should buzz.
+Install the **ntfy** app (iPhone App Store, or Android Play Store / F-Droid). Then pick one:
+
+**Option A – alerts anywhere (easiest, works on iPhone + Android):**
+1. In `.env` set `NTFY_SERVER=https://ntfy.sh` and a long random topic, e.g. `NTFY_TOPIC=farm-k7q2m9x4w1` (anyone who knows the topic can read it, so don't use something guessable).
+2. `docker compose up -d`
+3. In the app: **+** → Topic name = your `NTFY_TOPIC` → leave *Use another server* **unticked** → Subscribe.
+4. Test: `curl -d "test alert" https://ntfy.sh/YOUR_TOPIC`
+
+Note: alerts (photos, plates) pass through the public ntfy.sh server. Fine for testing; for the real site switch to Option B + a VPN.
+
+**Option B – private, site network only:**
+1. Keep `NTFY_SERVER=http://ntfy` in `.env`.
+2. In the app: **+** → Topic name = your `NTFY_TOPIC` → tick *Use another server* → `http://HOST_IP:8080` → Subscribe.
+3. Test: `curl -d "test alert" http://HOST_IP:8080/farm-alerts`
+Phones only get alerts on the site Wi-Fi (or over a VPN such as WireGuard). On iPhone, alerts may only appear when the app is opened.
 
 You get:
 - **UNKNOWN VEHICLE: <plate>** – with a 4K photo of the vehicle. Same plate won't re-alert for an hour.
@@ -205,5 +216,7 @@ model:
 | Plates never read | plate too small – zoom in so it's ~150 px wide in the 4K image; check `docker logs vision` for `read` lines |
 | No phone alert | `docker logs vision`; check the ntfy app server address + topic match `.env` |
 | "Cannot open" / "Could not grab" in vision logs | Frigate not running yet – `docker compose ps`; it retries automatically |
-| Live view slow / lagging behind / Mac hot | lower `FPS` to 3 and `DISPLAY_FPS` to 8; in the Reolink app set the main stream to 15 fps. `docker logs vision` shows "Stream 3840x2160 at N fps" – N should be close to the camera's frame rate |
+| Header shows "delay" above 1 s, or logs say "Fell behind live" | the computer can't decode 4K fast enough – see next row |
+| Live view slow / lagging behind / Mac hot | lower `FPS` to 3 and `DISPLAY_FPS` to 8; in the Reolink app set the main stream to 15 fps (and H.264 if offered – easier to decode); Docker Desktop → Settings → Resources → give it more CPUs. `docker logs vision` shows "Stream 3840x2160 at N fps" – N should be close to the camera's frame rate |
+| Camera clock in the picture doesn't match real time | Reolink app → Settings → Date & Time → turn on NTP / sync time |
 | Frigate live view blurry | click the camera → stream menu → choose **Main (4K)** |
